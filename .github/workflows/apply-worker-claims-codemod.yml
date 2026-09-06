@@ -30,8 +30,8 @@ jobs:
           from pathlib import Path
           path = Path('test/source-ssrf.test.ts')
           source = path.read_text()
-          old = r"/isProcessableSourceRecordForAngleExtraction\\(record, sourceUrlsWithAngles\\)/"
-          new = r"/isProcessableSourceRecordForAngleExtraction\\((?:record|candidate), sourceUrlsWithAngles\\)/"
+          old = r"/isProcessableSourceRecordForAngleExtraction\(record, sourceUrlsWithAngles\)/"
+          new = r"/isProcessableSourceRecordForAngleExtraction\((?:record|candidate), sourceUrlsWithAngles\)/"
           if source.count(old) != 1:
               raise SystemExit(f'expected exactly one source eligibility assertion, found {source.count(old)}')
           path.write_text(source.replace(old, new))
