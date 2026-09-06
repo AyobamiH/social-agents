@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 
 import config from '../config';
 import {
+  REQUIRED_WORKER_CLAIM_CAPABILITIES,
   WORKER_SCHEMA_CONTRACT,
   WorkerClaimsContractError,
   assertWorkerClaimsContract,
-  claimAngleRecordForDraft,
-  claimSourceRecordForExtraction,
+  claimAngleRecordById,
+  claimSourceRecordById,
   commitClaimedAngleDraft,
   commitSourceAngleExtraction,
   createClaimToken,
+  exhaustAngleRecordClaim,
 } from '../src/worker-claims';
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
@@ -40,30 +42,31 @@ async function main(): Promise<void> {
       assert.match(token, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     });
 
-    await test('schema capability probe requires worker-claims-v1 exactly', async () => {
+    await test('schema capability probe requires the complete worker-claims-v1 cutover', async () => {
       globalThis.fetch = (async () => new Response(JSON.stringify({
         contract: WORKER_SCHEMA_CONTRACT,
-        migration: '20260906154500',
-        capabilities: ['source-claim-lease-v1'],
+        migration: '20260906162000',
+        capabilities: [...REQUIRED_WORKER_CLAIM_CAPABILITIES],
       }), { status: 200 })) as typeof fetch;
 
       const contract = await assertWorkerClaimsContract();
       assert.equal(contract.contract, WORKER_SCHEMA_CONTRACT);
 
       globalThis.fetch = (async () => new Response(JSON.stringify({
-        contract: 'older-contract',
-        migration: 'older',
-        capabilities: [],
+        contract: WORKER_SCHEMA_CONTRACT,
+        migration: '20260906154500',
+        capabilities: ['source-angle-atomic-commit-v1'],
       }), { status: 200 })) as typeof fetch;
 
       await assert.rejects(
         () => assertWorkerClaimsContract(),
         (error: unknown) => error instanceof WorkerClaimsContractError
           && error.code === 'worker_claims_schema_unavailable'
+          && error.message.includes('source-targeted-claim-v1')
       );
     });
 
-    await test('source claim and commit preserve the exact fencing identity', async () => {
+    await test('targeted source claim and commit preserve the exact fencing identity', async () => {
       const bodies: Array<Record<string, unknown>> = [];
       const token = '22222222-2222-4222-8222-222222222222';
       const claimVersion = 7;
@@ -71,7 +74,7 @@ async function main(): Promise<void> {
         const url = String(input);
         const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
         bodies.push(body);
-        if (url.endsWith('/rpc/claim_source_record_for_extraction')) {
+        if (url.endsWith('/rpc/claim_source_record_by_id')) {
           return new Response(JSON.stringify([{
             id: 'source-1',
             user_id: 'user-1',
@@ -89,7 +92,7 @@ async function main(): Promise<void> {
         return new Response(JSON.stringify([{ inserted_count: 1, total_count: 1 }]), { status: 200 });
       }) as typeof fetch;
 
-      const claimed = await claimSourceRecordForExtraction('user-1', token);
+      const claimed = await claimSourceRecordById('user-1', 'source-1', token, 300);
       assert.equal(claimed.record?.claim_token, token);
       assert.equal(claimed.record?.claim_version, claimVersion);
       assert.ok(claimed.record);
@@ -101,20 +104,21 @@ async function main(): Promise<void> {
         intended_platform: 'x',
       }]);
 
+      assert.equal(bodies[0].p_source_record_id, 'source-1');
       assert.equal(bodies[0].p_claim_token, token);
       assert.equal(bodies[1].p_claim_token, token);
       assert.equal(bodies[1].p_claim_version, claimVersion);
       assert.equal(bodies[1].p_source_record_id, 'source-1');
     });
 
-    await test('angle claim and queue commit preserve claim version and schedule identity', async () => {
+    await test('targeted angle claim and queue commit preserve fencing and schedule identity', async () => {
       const bodies: Array<Record<string, unknown>> = [];
       const token = '33333333-3333-4333-8333-333333333333';
       globalThis.fetch = (async (input, init) => {
         const url = String(input);
         const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
         bodies.push(body);
-        if (url.endsWith('/rpc/claim_angle_record_for_draft')) {
+        if (url.endsWith('/rpc/claim_angle_record_by_id')) {
           return new Response(JSON.stringify([{
             id: 'angle-1',
             user_id: 'user-1',
@@ -147,7 +151,7 @@ async function main(): Promise<void> {
         }]), { status: 200 });
       }) as typeof fetch;
 
-      const claimed = await claimAngleRecordForDraft('user-1', ['x'], token);
+      const claimed = await claimAngleRecordById('user-1', 'angle-1', ['x'], token, 900);
       assert.ok(claimed.record);
       const row = await commitClaimedAngleDraft({
         userId: 'user-1',
@@ -163,10 +167,30 @@ async function main(): Promise<void> {
       });
 
       assert.equal(row.id, 'queue-1');
+      assert.equal(bodies[0].p_angle_record_id, 'angle-1');
+      assert.deepEqual(bodies[0].p_platforms, ['x']);
       assert.equal(bodies[1].p_claim_token, token);
       assert.equal(bodies[1].p_claim_version, 9);
       assert.equal(bodies[1].p_scheduled_local_date, '2026-09-07');
       assert.equal(bodies[1].p_scheduled_timezone, 'Europe/London');
+    });
+
+    await test('no-draft terminal operation keeps the original fencing generation', async () => {
+      let body: Record<string, unknown> = {};
+      globalThis.fetch = (async (_input, init) => {
+        body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+        return new Response('true', { status: 200 });
+      }) as typeof fetch;
+
+      const completed = await exhaustAngleRecordClaim('user-1', {
+        id: 'angle-1',
+        claim_token: '44444444-4444-4444-8444-444444444444',
+        claim_version: 11,
+      });
+
+      assert.equal(completed, true);
+      assert.equal(body.p_angle_record_id, 'angle-1');
+      assert.equal(body.p_claim_version, 11);
     });
   } finally {
     globalThis.fetch = originalFetch;
