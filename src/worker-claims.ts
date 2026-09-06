@@ -4,6 +4,14 @@ import { SupabaseRestError, supabaseRpc } from './supabase-client';
 import type { PlatformKey } from './types';
 
 export const WORKER_SCHEMA_CONTRACT = 'worker-claims-v1';
+export const REQUIRED_WORKER_CLAIM_CAPABILITIES = [
+  'source-targeted-claim-v1',
+  'angle-targeted-claim-v1',
+  'angle-exhaust-fenced-v1',
+  'source-angle-atomic-commit-v1',
+  'angle-queue-atomic-commit-v1',
+  'queue-angle-identity-v1',
+] as const;
 
 export interface WorkerSchemaContract {
   contract: string;
@@ -130,6 +138,13 @@ export async function assertWorkerClaimsContract(): Promise<WorkerSchemaContract
         `Expected ${WORKER_SCHEMA_CONTRACT}, received ${String(contract?.contract || 'missing')}`
       );
     }
+    const capabilities = new Set(contract.capabilities || []);
+    const missing = REQUIRED_WORKER_CLAIM_CAPABILITIES.filter(capability => !capabilities.has(capability));
+    if (missing.length) {
+      throw new WorkerClaimsContractError(
+        `${WORKER_SCHEMA_CONTRACT} is missing required capabilities: ${missing.join(', ')}`
+      );
+    }
     return contract;
   } catch (error) {
     if (error instanceof WorkerClaimsContractError) throw error;
@@ -152,6 +167,21 @@ export async function claimSourceRecordForExtraction(
 ): Promise<{ claimToken: string; record?: SourceRecordClaim }> {
   const rows = await supabaseRpc<SourceRecordClaim[]>('claim_source_record_for_extraction', {
     p_user_id: userId,
+    p_claim_token: claimToken,
+    p_lease_seconds: leaseSeconds,
+  }, { retrySafe: true });
+  return { claimToken, record: rows[0] };
+}
+
+export async function claimSourceRecordById(
+  userId: string,
+  sourceRecordId: string,
+  claimToken = createClaimToken(),
+  leaseSeconds = 90
+): Promise<{ claimToken: string; record?: SourceRecordClaim }> {
+  const rows = await supabaseRpc<SourceRecordClaim[]>('claim_source_record_by_id', {
+    p_user_id: userId,
+    p_source_record_id: sourceRecordId,
     p_claim_token: claimToken,
     p_lease_seconds: leaseSeconds,
   }, { retrySafe: true });
@@ -214,6 +244,23 @@ export async function claimAngleRecordForDraft(
   return { claimToken, record: rows[0] };
 }
 
+export async function claimAngleRecordById(
+  userId: string,
+  angleRecordId: string,
+  platforms: PlatformKey[],
+  claimToken = createClaimToken(),
+  leaseSeconds = 300
+): Promise<{ claimToken: string; record?: AngleRecordClaim }> {
+  const rows = await supabaseRpc<AngleRecordClaim[]>('claim_angle_record_by_id', {
+    p_user_id: userId,
+    p_angle_record_id: angleRecordId,
+    p_platforms: platforms,
+    p_claim_token: claimToken,
+    p_lease_seconds: leaseSeconds,
+  }, { retrySafe: true });
+  return { claimToken, record: rows[0] };
+}
+
 export async function renewAngleRecordClaim(
   userId: string,
   record: Pick<AngleRecordClaim, 'id' | 'claim_token' | 'claim_version'>,
@@ -238,6 +285,18 @@ export async function releaseAngleRecordClaim(
     p_claim_token: record.claim_token,
     p_claim_version: record.claim_version,
   });
+}
+
+export async function exhaustAngleRecordClaim(
+  userId: string,
+  record: Pick<AngleRecordClaim, 'id' | 'claim_token' | 'claim_version'>
+): Promise<boolean> {
+  return supabaseRpc<boolean>('exhaust_angle_record_claim', {
+    p_user_id: userId,
+    p_angle_record_id: record.id,
+    p_claim_token: record.claim_token,
+    p_claim_version: record.claim_version,
+  }, { retrySafe: true });
 }
 
 export async function commitClaimedAngleDraft(
