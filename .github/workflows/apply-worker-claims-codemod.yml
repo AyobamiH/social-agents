@@ -24,6 +24,18 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Relax brittle local-variable assertion without weakening source eligibility
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('test/source-ssrf.test.ts')
+          source = path.read_text()
+          old = r"/isProcessableSourceRecordForAngleExtraction\\(record, sourceUrlsWithAngles\\)/"
+          new = r"/isProcessableSourceRecordForAngleExtraction\\((?:record|candidate), sourceUrlsWithAngles\\)/"
+          if source.count(old) != 1:
+              raise SystemExit(f'expected exactly one source eligibility assertion, found {source.count(old)}')
+          path.write_text(source.replace(old, new))
+          PY
       - run: node scripts/prepare-worker-claims-codemod.mjs
       - run: node --check scripts/apply-worker-claims-codemod.mjs
       - run: node scripts/apply-worker-claims-codemod.mjs
@@ -32,7 +44,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/supabase-worker.ts
+          git add src/supabase-worker.ts test/source-ssrf.test.ts
           git diff --cached --quiet && exit 1
           git commit -m "Use fenced database claims for paid generation"
           git push origin HEAD:codex/atomic-worker-claims
