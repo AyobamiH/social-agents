@@ -1,0 +1,47 @@
+name: Apply publication cutover
+
+on:
+  push:
+    branches: [codex/publication-ledger-v1]
+    paths:
+      - scripts/apply-publication-cutover.mjs
+      - .github/workflows/apply-publication-cutover.yml
+
+permissions:
+  contents: read
+
+jobs:
+  cutover:
+    if: github.repository == 'AyobamiH/social-agents' && github.ref == 'refs/heads/codex/publication-ledger-v1'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Apply exact hash-guarded source delta
+        run: node scripts/apply-publication-cutover.mjs
+      - name: Run complete regression gate on resulting source
+        run: npm run ci
+      - name: Commit only the validated source delta
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -eu
+          git diff --check
+          git diff --stat
+          test "$(git diff --name-only | sort | tr '\n' ' ')" = "package.json src/linkedin.ts src/supabase-worker.ts src/x.ts test/publication-outcome.test.ts "
+          remote_head=$(git ls-remote origin refs/heads/codex/publication-ledger-v1 | cut -f1)
+          test "$remote_head" = "$EXPECTED_HEAD"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json src/linkedin.ts src/supabase-worker.ts src/x.ts test/publication-outcome.test.ts
+          git commit -m 'Wire hosted publishing and stale recovery through the durable ledger'
+          git push origin HEAD:refs/heads/codex/publication-ledger-v1
