@@ -4681,17 +4681,6 @@ function hasRecentJobActivity(logs: WorkerLogRow[], cutoffIso: string): boolean 
   });
 }
 
-function publishStageStarted(logs: WorkerLogRow[], queueItemId: string): boolean {
-  return logs.some(row => {
-    const context = logContext(row);
-    const loggedQueueItemId = logString(context, 'queueItemId');
-    if (loggedQueueItemId && loggedQueueItemId !== queueItemId) return false;
-    return row.message === 'published_queue_item'
-      || row.message === 'platform_publish_failed'
-      || row.message === 'instagram_image_generation_failed';
-  });
-}
-
 async function loadQueueItemForStalePublish(job: AgentJobRow, queueItemId: string): Promise<QueueItemRow | undefined> {
   return (await supabaseSelect<QueueItemRow>('queue_items', {
     select: 'id,user_id,platform,status,slot_index,scheduled_for,source_url,source_title,angle,error_message',
@@ -4704,89 +4693,6 @@ async function loadQueueItemForStalePublish(job: AgentJobRow, queueItemId: strin
 }
 
 // Legacy source-URL/time history matching removed. Ledger recovery uses exact identities.
-
-function stalePublishResult(
-  job: AgentJobRow,
-  row: QueueItemRow | undefined,
-  history: PublishHistoryRow | undefined,
-  logs: WorkerLogRow[]
-): JsonMap {
-  const queueItemId = queueItemIdFromPayload(job.payload);
-  if (!row) {
-    const message = 'Scheduled publish timed out, but the queue item no longer exists.';
-    const nextAction = 'Review Logs and publish history before retrying scheduled publishing.';
-    return {
-      outcome: 'blocked',
-      message,
-      nextAction,
-      error: 'queue_item_missing',
-      jobStatus: 'failed',
-      summary: {
-        outcome: 'blocked',
-        message,
-        nextAction,
-        failedStage: 'scheduled_publish',
-        failureCode: 'queue_item_missing',
-        queueItemId,
-        queueItemStatus: 'missing',
-        errors: ['queue_item_missing'],
-      },
-    };
-  }
-  const platform = row?.platform || 'unknown';
-  const externalPostId = String(history?.external_post_id || '').trim();
-  if (row.status === 'published' && history?.id && externalPostId) {
-    return publishSuccessResult(
-      job,
-      row,
-      history,
-      externalPostId,
-      history.published_at || nowIso()
-    );
-  }
-  const reconciled = row?.status === 'published' || Boolean(history);
-  const stageStarted = row?.status === 'publishing' || (queueItemId ? publishStageStarted(logs, queueItemId) : false);
-  const code = reconciled
-    ? PUBLISH_RECONCILED_CODE
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_CODE
-    : PUBLISH_INTERRUPTED_CODE;
-  const message = reconciled
-    ? PUBLISH_RECONCILED_MESSAGE
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_MESSAGE
-    : PUBLISH_INTERRUPTED_MESSAGE;
-  const nextAction = reconciled
-    ? PUBLISH_RECONCILED_NEXT_ACTION
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_NEXT_ACTION
-    : PUBLISH_INTERRUPTED_NEXT_ACTION;
-  const outcome = reconciled ? 'completed_with_errors' : 'blocked';
-
-  const summary: JsonMap = {
-    outcome,
-    message,
-    nextAction,
-    failedStage: reconciled ? 'publish_state_reconciliation' : stageStarted ? 'scheduled_publish' : 'publish_claim',
-    failureCode: code,
-    platform,
-    queueItemId,
-    queueItemStatus: row?.status || 'missing',
-    scheduledFor: row?.scheduled_for || null,
-    publishHistoryId: history?.id || null,
-    externalPostId: history?.external_post_id || null,
-    errors: [message],
-  };
-
-  return {
-    outcome,
-    message,
-    nextAction,
-    error: code,
-    jobStatus: reconciled ? 'completed_with_errors' : 'failed',
-    summary,
-  };
-}
 
 async function stalePublishJobResult(job: AgentJobRow, _logs: WorkerLogRow[]): Promise<JsonMap> {
   const queueItemId = queueItemIdFromPayload(job.payload);
@@ -5012,7 +4918,6 @@ export const __test__ = {
   sourceIntentFor,
   sourceIntentRejectReasons,
   sourceScopeFor,
-  stalePublishResult,
 };
 
 if (typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module) {
