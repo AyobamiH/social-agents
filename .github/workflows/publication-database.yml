@@ -1,0 +1,60 @@
+name: Publication database integration
+
+on:
+  pull_request:
+  push:
+    branches: [codex/publication-ledger-v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publication-database-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publication-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_NO_UPDATE_NOTIFIER: '1'
+      PUBLICATION_DATABASE_TEST: local-only
+    steps:
+      - name: Checkout Worker
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Checkout exact tested schema contract
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: AyobamiH/oneclickpostfactory
+          ref: 31ce54652c853196442f998fa725bdc22c6efdc1
+          path: .schema-contract
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked Worker dependencies
+        run: npm ci
+      - name: Install pinned Supabase CLI
+        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.116.0
+      - name: Verify immutable migration history
+        working-directory: .schema-contract
+        run: node scripts/check-migration-history.mjs
+      - name: Start isolated Supabase from the full migration chain
+        working-directory: .schema-contract
+        run: supabase start
+      - name: Run all schema behaviour contracts
+        working-directory: .schema-contract
+        run: supabase test db --local
+      - name: Execute real Worker and database failure scenarios
+        run: npx tsx test/publication-database.integration.ts
+      - name: Stop isolated database
+        if: always()
+        working-directory: .schema-contract
+        run: supabase stop --no-backup
