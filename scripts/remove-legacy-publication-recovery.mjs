@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
+// One-shot guarded cleanup: source and migrated tests must pass together before commit.
 const path = 'src/supabase-worker.ts';
 const source = readFileSync(path, 'utf8');
 const blobSha = createHash('sha1')
