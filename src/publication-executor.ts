@@ -1,5 +1,6 @@
 import * as ledger from './publication-ledger';
 import { classifyPostDispatchError } from './publication-outcome';
+import { recordObservedAcceptance } from './publication-receipts';
 import { supabaseSelect } from './supabase-client';
 import type { PlatformKey } from './types';
 
@@ -39,7 +40,7 @@ export class PublicationPreflightError extends Error {
 }
 
 const UNKNOWN_ACTION = 'Do not retry or recreate this post. Reconcile the exact publication attempt before another dispatch.';
-const SAFE_RETRY_ACTION = 'No provider dispatch occurred. Resolve the blocker before retrying this same queue item.';
+const SAFE_RETRY_ACTION = 'This execution did not dispatch. Reconcile any existing attempt or resolve the blocker before retrying this same queue item.';
 
 type Ledger = Pick<typeof ledger,
   | 'assertPublicationLedgerContract'
@@ -51,6 +52,11 @@ type Ledger = Pick<typeof ledger,
   | 'recordPublicationUnknown'
   | 'loadPublicationStateForQueueItem'
 >;
+
+const productionLedger: Ledger = {
+  ...ledger,
+  recordPublicationAccepted: recordObservedAcceptance,
+};
 
 function result(
   target: PublicationTarget,
@@ -68,7 +74,7 @@ function result(
         ? 'Publication outcome requires reconciliation. No automatic resend is allowed.'
         : outcome === 'rejected'
           ? 'The provider rejected this attempt. No acceptance receipt was created.'
-          : 'Publication is blocked before dispatch.';
+          : 'Publication is blocked before a new dispatch.';
   const nextAction = accepted ? 'No resend is needed.'
     : outcome === 'unknown' ? UNKNOWN_ACTION
       : outcome === 'rejected' ? 'Resolve the provider rejection, then use the authorised recovery flow.'
@@ -181,7 +187,7 @@ async function recordUnknownBestEffort(
 export async function executePublication(
   target: PublicationTarget,
   hooks: PublicationHooks,
-  db: Ledger = ledger
+  db: Ledger = productionLedger
 ): Promise<PublicationExecutionResult> {
   let state: ledger.PublicationStateSnapshot;
   try {
@@ -303,7 +309,7 @@ export async function executePublication(
 export async function reconcilePublication(
   target: PublicationTarget,
   now = Date.now(),
-  db: Ledger = ledger
+  db: Ledger = productionLedger
 ): Promise<PublicationExecutionResult> {
   let state: ledger.PublicationStateSnapshot;
   try {
