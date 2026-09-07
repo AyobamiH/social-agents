@@ -198,6 +198,12 @@ export async function executePublication(
   }
   const existing = terminalResult(target, state);
   if (existing) return existing;
+  // This executor is hosted-only. Do not claim/freeze unavailable provider media,
+  // refresh credentials, or spend on generation merely to rediscover retirement.
+  if (target.platform === 'threads' || target.platform === 'instagram') {
+    return result(target, 'blocked', 'legacy_meta_publication_disabled', state);
+  }
+  if (target.platform === 'facebook') return result(target, 'blocked', 'facebook_paused', state);
 
   const claimToken = ledger.createPublicationClaimToken();
   let intent: ledger.PublicationIntent;
@@ -205,7 +211,7 @@ export async function executePublication(
     intent = await db.claimPublicationIntent(target.userId, target.queueItemId, claimToken, 120);
   } catch {
     const current = await readBestEffort(target, db);
-    return terminalResult(target, current) || result(target, 'blocked', 'publication_claim_not_acquired');
+    return terminalResult(target, current) || result(target, 'blocked', 'publication_claim_not_acquired', current);
   }
   // Do not release a row with a mismatched identity, even when the Data API returned it.
   if (!validIntent(target, intent) || intent.claim_token !== claimToken
@@ -300,7 +306,14 @@ export async function executePublication(
   } catch {
     bookkeepingPending = true;
   }
-  const finished = result(target, accepted.state === 'verified' ? 'verified' : 'accepted', null, { intent, attempt: accepted }, { bookkeepingPending });
+  // Enrich the response with exact history identity without making this read a
+  // condition of provider acceptance or reopening the send path on read failure.
+  const finalState = await readBestEffort(target, db);
+  const receiptState = validAttempt(target, finalState)
+    && finalState.attempt?.id === accepted.id
+    && finalState.attempt.external_post_id === accepted.external_post_id
+      ? finalState : { intent, attempt: accepted };
+  const finished = result(target, accepted.state === 'verified' ? 'verified' : 'accepted', null, receiptState, { bookkeepingPending });
   if (bookkeepingPending) finished.jobStatus = 'completed_with_errors';
   return finished;
 }
