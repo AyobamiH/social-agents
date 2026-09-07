@@ -1,5 +1,4 @@
-import { HttpError } from './errors';
-import { isPlatformPublishError, platformErrorContext } from './platform-errors';
+import { isPlatformPublishError } from './platform-errors';
 
 export type PostDispatchOutcome = 'rejected' | 'unknown';
 
@@ -10,56 +9,26 @@ export interface PublicationErrorClassification {
   providerReceipt: Record<string, unknown>;
 }
 
-function isKnownRequestRejectionStatus(status: number | undefined): boolean {
-  if (!status) return false;
-  return status >= 400 && status < 500 && status !== 408;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error || 'publication failed');
-}
+// A conflict may describe an existing post; a timeout is never proof of absence.
+const DEFINITIVE_REJECTION_STATUSES = new Set([400, 401, 403, 404, 413, 415, 422, 429]);
 
 export function classifyPostDispatchError(error: unknown): PublicationErrorClassification {
-  if (isPlatformPublishError(error)) {
-    const knownRequestRejection = error.stage === 'post'
-      && isKnownRequestRejectionStatus(error.status);
-    return {
-      outcome: knownRequestRejection ? 'rejected' : 'unknown',
-      code: knownRequestRejection
-        ? `provider_rejected_${error.code}`
-        : `provider_outcome_unknown_${error.code}`,
-      message: error.userMessage,
-      providerReceipt: {
-        ...platformErrorContext(error),
-        outcome_classification: knownRequestRejection ? 'known_rejected' : 'ambiguous_unknown',
-      },
-    };
-  }
-
-  if (error instanceof HttpError) {
-    const knownRequestRejection = isKnownRequestRejectionStatus(error.status);
-    return {
-      outcome: knownRequestRejection ? 'rejected' : 'unknown',
-      code: knownRequestRejection
-        ? `provider_rejected_${error.code}`
-        : `provider_outcome_unknown_${error.code}`,
-      message: error.message,
-      providerReceipt: {
-        error_type: error.name,
-        normalized_error_code: error.code,
-        http_status: error.status ?? null,
-        outcome_classification: knownRequestRejection ? 'known_rejected' : 'ambiguous_unknown',
-      },
-    };
-  }
-
+  const providerError = isPlatformPublishError(error) ? error : undefined;
+  const rejected = Boolean(providerError?.stage === 'post'
+    && DEFINITIVE_REJECTION_STATUSES.has(providerError.status || 0));
+  const safeCode = providerError && /^[a-z0-9_]{1,80}$/.test(providerError.code)
+    ? providerError.code : 'unclassified_error';
+  const outcome = rejected ? 'rejected' : 'unknown';
   return {
-    outcome: 'unknown',
-    code: 'provider_outcome_unknown_unclassified_error',
-    message: errorMessage(error),
+    outcome,
+    code: `provider_${rejected ? 'rejected' : 'outcome_unknown'}_${safeCode}`,
+    message: rejected
+      ? 'The provider rejected this publication attempt.'
+      : 'The provider outcome is uncertain. Reconcile the exact attempt before retrying.',
+    // Deliberate allowlist: never persist raw errors, headers, URLs, or response snippets.
     providerReceipt: {
-      error_type: error instanceof Error ? error.name : 'unknown',
-      outcome_classification: 'ambiguous_unknown',
+      ...(providerError ? { platform: providerError.platform, http_status: providerError.status ?? null } : {}),
+      outcome_classification: rejected ? 'known_rejected' : 'ambiguous_unknown',
     },
   };
 }
