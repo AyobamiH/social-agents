@@ -5,11 +5,11 @@ import config from '../config';
 import { encryptCredential } from '../src/tenant-credentials';
 import { installScopedConfig, runWithRuntimeScope } from '../src/runtime-scope';
 import { __test__ as worker } from '../src/supabase-worker';
-import { reconcilePublication } from '../src/publication-executor';
-import { loadPublicationStateForQueueItem } from '../src/publication-ledger';
+import { reconcilePublication, recoverStalePublications } from '../src/publication-executor';
+import { loadPublicationStateForQueueItem, claimPublicationIntent, beginPublicationDispatch } from '../src/publication-ledger';
 
-// This suite can only reach an ephemeral local Supabase. Social APIs are intercepted;
-// it is real database/Worker evidence, not live-provider authorisation or visibility proof.
+// Real local database and Worker; social transport is intercepted. No live-provider
+// authorisation or visibility claim is made by this suite.
 if (process.env.PUBLICATION_DATABASE_TEST !== 'local-only') throw new Error('Local database test opt-in required');
 const local = JSON.parse(execFileSync('supabase', ['status', '--output', 'json'], {
   cwd: '.schema-contract', encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -38,7 +38,7 @@ interface Fixture {
 const tokens = new Map<string, string>();
 const posts = new Map<string, number>();
 const texts = new Map<string, string[]>();
-const modes = new Map<string, 'timeout' | 'reject' | 'pause'>();
+const modes = new Map<string, 'timeout' | 'reject' | 'pause' | 'late'>();
 let lostRpc: { path: string; remaining: number } | undefined;
 let totalWrites = 0;
 const realFetch = globalThis.fetch;
@@ -51,8 +51,7 @@ globalThis.fetch = (async (input, init) => {
     }
     return response;
   }
-  const headers = new Headers(init?.headers);
-  const token = (headers.get('authorization') || '').replace(/^Bearer /, '');
+  const token = (new Headers(init?.headers).get('authorization') || '').replace(/^Bearer /, '');
   const owner = tokens.get(token);
   assert.ok(owner, 'provider receives only the intended fixture tenant credential');
   if (url.hostname === 'api.x.com' && url.pathname === '/2/users/me') {
@@ -62,15 +61,19 @@ globalThis.fetch = (async (input, init) => {
   }
   if ((url.hostname === 'api.x.com' && url.pathname === '/2/tweets') || (url.hostname === 'api.linkedin.com' && url.pathname === '/v2/ugcPosts')) {
     assert.equal(init?.method, 'POST'); totalWrites++;
+    const providerId = String(900000 + totalWrites);
     posts.set(owner, (posts.get(owner) || 0) + 1);
     const body = JSON.parse(String(init?.body));
     const text = body.text || body.specificContent?.['com.linkedin.ugc.ShareContent']?.shareCommentary?.text;
     texts.set(owner, [...(texts.get(owner) || []), text]);
-    // At provider dispatch the database must already own an immutable attempt.
     assert.ok(Number(sql(`SELECT count(*) FROM public.publication_attempts WHERE user_id = ${literal(owner)}::uuid AND state = 'dispatching';`)) > 0);
     if (modes.get(owner) === 'timeout') throw new TypeError('injected lost provider response');
     if (modes.get(owner) === 'reject' || url.hostname === 'api.linkedin.com') return Response.json({ message: 'fixture payload rejection' }, { status: 422 });
-    return Response.json({ data: { id: String(900000 + totalWrites) } }, { status: 201 });
+    if (modes.get(owner) === 'late') {
+      const queueId = sql(`SELECT queue_item_id FROM public.publication_attempts WHERE user_id = ${literal(owner)}::uuid AND state = 'dispatching';`);
+      assert.equal((await reconcilePublication({ userId: owner, queueItemId: queueId, platform: 'x' }, Date.now() + 300_000)).outcome, 'unknown');
+    }
+    return Response.json({ data: { id: providerId } }, { status: 201 });
   }
   throw new Error(`External network forbidden in integration tests: ${url.origin}`);
 }) as typeof fetch;
@@ -105,10 +108,11 @@ async function test(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
-  await test('real scheduled Worker path records exact immutable acceptance and handles duplicate delivery', async () => {
+  await test('real scheduled Worker records exact immutable acceptance and handles duplicate delivery', async () => {
     const f = seed();
     sql(`UPDATE public.queue_items SET draft_text = 'approved revision before claim' WHERE id = ${literal(f.row.id)}::uuid;`);
-    assert.equal((await run(f)).outcome, 'accepted');
+    const r = await run(f);
+    assert.equal(r.outcome, 'accepted'); assert.ok(r.publishHistoryId);
     assert.deepEqual(texts.get(f.user), ['approved revision before claim']);
     const receipt = await state(f);
     assert.equal(receipt.history?.queue_item_id, f.row.id);
@@ -125,7 +129,7 @@ async function main() {
     assert.equal(Number(sql(`SELECT count(*) FROM public.publication_attempts WHERE user_id = ${literal(f.user)}::uuid;`)), 1);
     assert.equal((await state(f)).attempt?.state, 'accepted');
   });
-  await test('two tenant executions interleave with their own encrypted credentials and source snapshots', async () => {
+  await test('two tenants interleave with their own encrypted credentials and source snapshots', async () => {
     const a = seed(), b = seed();
     await Promise.all([run(a), run(b)]);
     assert.deepEqual(texts.get(a.user), [`authorised-${a.user}`]);
@@ -133,7 +137,7 @@ async function main() {
     assert.equal((await state(a)).attempt?.provider_account_ref, `account-${a.user}`);
     assert.equal((await state(b)).attempt?.provider_account_ref, `account-${b.user}`);
   });
-  await test('Postgres history failure rolls back acceptance atomically and blocks repeat publication', async () => {
+  await test('Postgres history failure rolls back acceptance and blocks repeat publication', async () => {
     const f = seed();
     sql(`CREATE OR REPLACE FUNCTION public.fixture_fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.queue_item_id = ${literal(f.row.id)}::uuid THEN RAISE EXCEPTION 'injected history failure'; END IF; RETURN NEW; END; $$;
       CREATE TRIGGER fixture_fail_history BEFORE INSERT ON public.publish_history FOR EACH ROW EXECUTE FUNCTION public.fixture_fail_history();`);
@@ -145,32 +149,32 @@ async function main() {
     await run(f); assert.equal(posts.get(f.user), 1);
     sql('DROP TRIGGER fixture_fail_history ON public.publish_history; DROP FUNCTION public.fixture_fail_history();');
   });
-  await test('lost accepted RPC responses reconcile from the actual committed receipt', async () => {
+  await test('lost accepted RPC responses reconcile from the committed receipt', async () => {
     const f = seed(); lostRpc = { path: '/record_publication_accepted', remaining: 3 };
     assert.equal((await run(f)).outcome, 'accepted');
     assert.equal(lostRpc.remaining, 0); lostRpc = undefined;
     assert.equal((await state(f)).attempt?.state, 'accepted'); assert.equal(posts.get(f.user), 1);
   });
-  await test('lost begin-dispatch responses create no provider call and preserve unknown attempt', async () => {
+  await test('lost begin-dispatch responses create no provider call and preserve unknown', async () => {
     const f = seed(); lostRpc = { path: '/begin_publication_dispatch', remaining: 3 };
     assert.equal((await run(f)).outcome, 'unknown');
     assert.equal(lostRpc.remaining, 0); lostRpc = undefined;
     assert.equal(posts.get(f.user) || 0, 0); assert.equal((await state(f)).attempt?.state, 'unknown');
     await run(f); assert.equal(posts.get(f.user) || 0, 0);
   });
-  await test('lost claim response reuses its token and fence instead of taking new work', async () => {
+  await test('lost claim response reuses its token and fence', async () => {
     const f = seed(); lostRpc = { path: '/claim_publication_intent', remaining: 1 };
     assert.equal((await run(f)).outcome, 'accepted'); lostRpc = undefined;
     assert.equal((await state(f)).intent?.claim_version, 1); assert.equal(posts.get(f.user), 1);
   });
-  await test('provider timeout remains unknown through stale-job recovery and repeated jobs', async () => {
+  await test('provider timeout remains unknown through stale recovery and repeated jobs', async () => {
     const f = seed(); modes.set(f.user, 'timeout');
     assert.equal((await run(f)).outcome, 'unknown');
     assert.equal((await worker.stalePublishJobResult(job(f), [])).outcome, 'unknown');
     await run(f); assert.equal(posts.get(f.user), 1);
     assert.equal(sql(`SELECT status FROM public.queue_items WHERE id = ${literal(f.row.id)}::uuid;`), 'publishing');
   });
-  await test('known rejection records failed projection without inventing a history receipt', async () => {
+  await test('known rejection records failed projection without inventing history', async () => {
     const f = seed(); modes.set(f.user, 'reject');
     assert.equal((await run(f)).outcome, 'rejected');
     assert.equal((await state(f)).attempt?.state, 'rejected'); assert.equal((await state(f)).history, undefined);
@@ -182,11 +186,12 @@ async function main() {
     assert.equal((await run(f)).failureCode, 'publish_automation_disabled');
     assert.equal((await state(f)).attempt, undefined); assert.equal(posts.get(f.user) || 0, 0);
   });
-  await test('disabled hosted Meta causes zero provider or paid media calls', async () => {
+  await test('disabled Meta causes zero provider, media, claim or revision mutations', async () => {
     for (const platform of ['threads', 'instagram'] as const) {
       const f = seed(platform);
       assert.equal((await run(f)).failureCode, 'legacy_meta_publication_disabled');
-      assert.equal((await state(f)).attempt, undefined); assert.equal(posts.get(f.user) || 0, 0);
+      assert.equal((await state(f)).intent, undefined); assert.equal(posts.get(f.user) || 0, 0);
+      assert.equal(sql(`SELECT status FROM public.queue_items WHERE id = ${literal(f.row.id)}::uuid;`), 'ready');
     }
   });
   await test('publish_all retains independent platform outcomes', async () => {
@@ -196,11 +201,35 @@ async function main() {
     assert.equal((r.published as unknown[]).length, 1); assert.equal((r.failures as unknown[]).length, 1);
     assert.equal((await state(f)).attempt?.state, 'accepted'); assert.equal((await state(other)).attempt?.state, 'rejected');
   });
-  await test('claim without external dispatch recovers safely; legacy ambiguous row does not', async () => {
+  await test('legacy ambiguous rows stay quarantined without source-URL guesses', async () => {
     const f = seed();
     sql(`UPDATE public.queue_items SET status = 'publishing' WHERE id = ${literal(f.row.id)}::uuid;`);
     assert.equal((await reconcilePublication(target(f))).failureCode, 'legacy_publication_requires_reconciliation');
     assert.equal(sql(`SELECT status FROM public.queue_items WHERE id = ${literal(f.row.id)}::uuid;`), 'publishing');
+    assert.equal(posts.get(f.user) || 0, 0);
+  });
+  await test('late provider acceptance resolves a stale unknown attempt with exact positive evidence', async () => {
+    const f = seed(); modes.set(f.user, 'late');
+    assert.equal((await run(f)).outcome, 'accepted');
+    const s = await state(f);
+    assert.equal(s.attempt?.state, 'accepted'); assert.ok(s.attempt?.reconciled_at);
+    assert.equal(s.attempt?.reconciliation_evidence?.kind, 'exact_attempt_provider_acceptance_response');
+    assert.equal(s.history?.publication_attempt_id, s.attempt?.id);
+    assert.equal(s.attempt?.verified_at, null);
+    await run(f); assert.equal(posts.get(f.user), 1);
+  });
+  await test('expired pre-dispatch ownership releases through the real fenced RPC', async () => {
+    const f = seed(); await claimPublicationIntent(f.user, f.row.id, randomUUID(), 120);
+    assert.equal((await reconcilePublication(target(f), Date.now() + 300_000)).outcome, 'retry_wait');
+    assert.equal((await state(f)).intent?.state, 'scheduled');
+    assert.equal(sql(`SELECT status FROM public.queue_items WHERE id = ${literal(f.row.id)}::uuid;`), 'ready');
+    assert.equal(posts.get(f.user) || 0, 0);
+  });
+  await test('orphan dispatch is recovered without a parent job or any provider write', async () => {
+    const f = seed(); const intent = await claimPublicationIntent(f.user, f.row.id, randomUUID(), 120);
+    await beginPublicationDispatch({ userId: f.user, intent, dispatchOperationId: randomUUID(), providerAccountRef: `account-${f.user}`, providerIdempotencySupported: false });
+    assert.ok(await recoverStalePublications(Date.now() + 300_000) >= 1);
+    assert.equal((await state(f)).attempt?.state, 'unknown');
     assert.equal(posts.get(f.user) || 0, 0);
   });
   console.log(`PUBLICATION_DATABASE_INTEGRATION_PASS scenarios=${scenarios}; real Supabase/Postgres; provider transport intercepted; live_posts=0`);
