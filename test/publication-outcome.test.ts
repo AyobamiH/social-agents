@@ -52,10 +52,10 @@ async function main(): Promise<void> {
     assert.equal(result.outcome, 'unknown');
   });
 
-  await test('network-layer 4xx is rejected but network/server failures are unknown', async () => {
+  await test('generic HTTP errors are not evidence of provider rejection', async () => {
     assert.equal(
       classifyPostDispatchError(new HttpError(400, 'bad request', { code: 'UPSTREAM_HTTP_ERROR' })).outcome,
-      'rejected'
+      'unknown'
     );
     assert.equal(
       classifyPostDispatchError(new HttpError(504, 'timeout', { code: 'UPSTREAM_TIMEOUT' })).outcome,
