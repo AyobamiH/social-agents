@@ -20,6 +20,11 @@ function removeBetween(text, start, end) {
   return text.slice(0, first) + text.slice(second);
 }
 
+function removeExact(text, exact) {
+  if (text.split(exact).length !== 2) throw new Error(`Expected exactly one: ${exact.trim()}`);
+  return text.replace(exact, '');
+}
+
 let next = source;
 next = removeBetween(
   next,
@@ -31,10 +36,11 @@ next = removeBetween(
   'function stalePublishResult(',
   'async function stalePublishJobResult('
 );
+next = removeExact(next, '  stalePublishResult,\n');
 
 for (const forbidden of [
-  'function publishStageStarted(',
-  'function stalePublishResult(',
+  'publishStageStarted',
+  'stalePublishResult',
   'findPublishHistoryForQueueItem',
 ]) {
   if (next.includes(forbidden)) throw new Error(`Legacy recovery symbol remains: ${forbidden}`);
