@@ -1,63 +1,78 @@
 # Reliability repair progress
 
-This file records only implementation status that is evidenced by repository changes and CI. It does not claim production deployment or provider readiness.
+This file records implementation status, not production deployment or provider readiness. The final exact-SHA CI receipts are recorded on the relevant pull requests. A passing component test is not live account evidence.
 
 ## Sequence 1: release identity and complete CI gate
 
-Status: merged to upstream `main` through PR #2. The final pre-merge branch head was proven by the complete upstream pull-request CI gate before merge.
+Merged to upstream through PR #2. `npm run ci` gates typecheck, the complete normal regression suite and the compiled-runtime smoke check. Deployment invokes that same gate. Cloudflare version metadata and the Git SHA are exposed separately from provider readiness.
 
-Evidence:
+Hosted Threads and Instagram remain unavailable; Facebook remains paused; LinkedIn compatibility is unverified; X requires a tenant-owned connection. No production deployment is claimed here.
 
-- `npm run ci` gates typecheck, the complete repository test suite, and the compiled runtime smoke check.
-- the deploy workflow runs that same gate before Wrangler deployment.
-- Cloudflare version metadata and the deployment Git SHA are exposed separately from provider readiness.
-- hosted Threads and Instagram publication remain explicitly unavailable; Facebook remains paused; LinkedIn compatibility remains unverified; X remains tenant-scoped.
-- no production deployment is claimed by this change.
+## D03 containment and async runtime isolation
 
-## D03 containment: overlapping tenant runtime state
+Upstream PR #3 added a shared per-isolate exclusive gate for scheduled and authenticated tick drains. Its regression proves overlapping drains do not enter mutable tenant runtime concurrently and rejection releases the gate.
 
-Status: merged to upstream `main` through PR #3 after fresh upstream CI passed on the branch synchronised to the PR #2 merge commit.
+Upstream PR #4 added async-local configuration and token callback isolation. Its recorded pre-merge head was `f68e4434efc18053d11c85ff1b3d2dd334c5dc3d`; merge commit `033b9b578c120bec0b725311eba1db3d3bfe5530`.
 
-The Cloudflare scheduled and authenticated `/tick` job-drain entry points share one per-isolate exclusive run gate. This prevents two overlapping SaaS drains in the same Worker isolate from entering the mutable tenant runtime concurrently. Separate Worker isolates do not share process globals.
+The Worker installs scoped configuration accessors after loading Cloudflare bindings. Each SaaS drain runs inside `AsyncLocalStorage`. Tenant values and Threads/LinkedIn/X token-persistence callbacks stay in the originating execution. Local single-tenant behaviour is retained outside that scope. `processPendingSupabaseJobs()` remains serial and the exclusive drain gate remains in place.
 
-The containment regression deliberately interleaves two executions, proves maximum concurrent execution is one, and proves a rejected execution releases the gate.
+This addresses cross-execution process-global leakage. It is not a claim that every provider now uses explicit immutable client arguments, or that credential-version/disconnect fencing exists. Those connection-lifecycle contracts remain separate work.
 
-## D03 runtime isolation: process-global config and token callbacks
+## D22: explicit platform activation
 
-Status: merged to upstream `main` through PR #4. Fresh upstream CI run #88 passed `npm ci` and the complete `npm run ci` gate on synchronised head `f68e4434efc18053d11c85ff1b3d2dd334c5dc3d` before merge. The upstream PR #4 merge commit is `033b9b578c120bec0b725311eba1db3d3bfe5530`.
+Present in this branch: only exact persisted boolean `true` enables a platform. Missing rows, fields, null and false fail closed. The schema-owner bootstrap also contains default-false settings and matching UI semantics. Existing legacy true values are not mass-rewritten because their original intent cannot be inferred safely.
 
-The Worker installs async-scoped accessors on the existing config object only after Cloudflare bindings have been copied into `process.env`. Each scheduled/authenticated SaaS drain then runs inside its own `AsyncLocalStorage` context.
+## D04/D05/D06: source and angle claims and safe transport
 
-Within that context:
+This branch is stacked on `codex/atomic-worker-claims`, head `984d0afa1fdfd696153fa8615615b1e2d42596e3`. That dependency introduces the typed worker-claims contract, database-owned source/angle leases and fencing, atomic generation finalisation, and explicit Supabase RPC retry semantics.
 
-- tenant config writes made by the existing `withTenantRuntime` path are copy-on-write and remain inside the current async execution instead of mutating process-global values;
-- OpenAI, Cloudinary, Instagram, Facebook and provider modules that already read the shared config object transparently resolve the scoped values without a flag-day call-signature rewrite;
-- Threads, LinkedIn and X token-persistence setters use scope-local callback slots when a SaaS runtime scope exists;
-- token rotation updates only the current scoped config snapshot while the Supabase persistence callback remains attached to that same async execution;
-- outside a SaaS runtime scope, the existing local single-tenant behaviour is preserved.
+Ordinary ambiguous mutations are single-attempt. Only reads and RPCs whose exact request identities are designed to be idempotent opt into retries. This does not claim that every agent job/enqueue path already has durable uniqueness or fencing.
 
-The current `processPendingSupabaseJobs()` implementation remains serial, so tenant runtime mutation is restored between jobs inside a drain. The earlier exclusive run gate remains defence-in-depth but is no longer the only boundary preventing overlapping Worker invocations from sharing config or token callbacks.
+## D07/D08/D09: connected publication execution
 
-The proven regression covers overlapping tenant credentials, scope-local Threads/LinkedIn/X persistence callbacks, rotated-token isolation, base-config isolation and failure cleanup. Explicit provider-client arguments remain desirable architectural cleanup, but the process-global cross-tenant safety defect is no longer the active blocker.
+The hosted Worker consumer is now wired in `codex/publication-ledger-v1`, fork PR `AyobamiH/social-agents#4`, not merely a collection of unused helper modules.
 
-No provider is re-enabled and no deployment was performed by these D03 repairs.
+### Execution boundary
 
-## D22: fail-closed tenant platform activation
+`publishQueueRow()` delegates to `executePublication()`:
 
-Status: implemented on `codex/fail-closed-platform-settings`; upstream pull-request CI evidence is required before merge.
+1. Probe the exact `publication-ledger-v1` schema/capability contract.
+2. Read existing outcome by tenant and queue identity. Accepted, rejected, dispatching or unknown publications never become a blind resend.
+3. Reject unavailable hosted Meta and paused Facebook before claim, token refresh or paid media work.
+4. Claim one immutable queue snapshot with a caller-owned token and fencing version.
+5. Prepare credentials, identify the provider account, and recheck entitlement, explicit enablement and scheduled automation/due time.
+6. Persist the dispatch attempt before the provider write.
+7. Publish only the database snapshot and make one provider publishing request per attempt.
+8. Record acceptance and the queue/history projection transactionally through the ledger.
 
-Tenant platform activation now has one explicit policy: a platform is active only when its persisted `*_enabled` setting is exactly boolean `true`. Missing settings rows, missing fields, `null` and `false` all remain disabled.
+Provider dispatch and database finalisation have different error boundaries. A database failure after provider success cannot be interpreted as a provider rejection. Lost begin-dispatch responses cause no provider call. Uncertain provider outcomes stay unknown and non-retryable.
 
-The regression covers:
+Post-acceptance angle/telemetry failures cannot reopen sending. Where possible the result includes the exact history ID as well as intent, attempt and provider IDs. Provider acceptance and later visibility verification remain separate.
 
-- a missing settings object enabling no platforms;
-- all-null flags enabling no platforms;
-- all-false flags enabling no platforms;
-- mixed settings enabling only explicit `true` entries;
-- canonical platform ordering when all five platforms are explicitly enabled.
+### Recovery boundary
 
-No provider is re-enabled, no credential semantics change, no queue or billing behaviour changes, and no deployment is performed by this repair.
+`stalePublishJobResult()` calls exact ledger reconciliation. The source-URL/platform/time history matcher has been removed from production orchestration. `recoverStalePublications()` also scans orphan claims/dispatches independently of parent job status, including publish-all work.
 
-## Next bounded repair
+Expired pre-dispatch ownership may be released with its token/fence. Stale dispatches become unknown. Legacy publishing rows without ledger identity remain quarantined, not relabelled failed so they can be retried.
 
-After D22 is green and merged, proceed to atomic database claims/fencing for jobs, sources and angles, then publication-attempt identity and unknown-outcome handling. Meta publication remains disabled until the publication ledger and provider-specific restoration work are ready.
+A delayed positive provider response can resolve its own unknown attempt using exact attempt ID, dispatch operation ID, external object ID and recorded response evidence. Negative search results are not sufficient evidence. Visibility is not inferred from acceptance.
+
+### Adapter corrections and preserved limits
+
+X no longer refreshes and repeats POST after an auth-looking response. Read-only identity verification may refresh after explicit HTTP 401. LinkedIn uses its returned object ID or `x-restli-id`, never the placeholder `posted`.
+
+This does not migrate LinkedIn to the newer Posts API, restore Meta, grant provider scopes, or implement new formats. No provider is newly enabled. Connection rotation/removal version fences and full revision-approval lifecycle still need their own release evidence. The ledger guarantees the claimed snapshot is what is sent; it does not manufacture an earlier approval record.
+
+### Test boundary and ownership
+
+The normal regression gate includes executor fault injection, provider single-dispatch checks and delayed receipt reconciliation. `test/publication-database.integration.ts` exercises the actual Worker, encryption, async tenant contexts, Supabase REST/RPC transport and a real local Postgres database. Provider network calls are intercepted: this is integration/failure evidence, not live-provider evidence.
+
+The cross-repository integration workflow belongs to the private schema-owner repository, `AyobamiH/oneclickpostfactory`, at `.github/workflows/publication-worker-integration.yml`. It checks out an exact public Worker SHA and its own schema. No broad cross-repository secret is needed and no private schema is copied into this public repository. The integration must be rerun with a new exact Worker pin whenever the consumer changes.
+
+The one-time hash-guarded source-edit workflow and script were removed after committing the source delta. No write-enabled test/codemod workflow remains from this cutover.
+
+## Production remains gated
+
+Neither schema nor consumer is deployed by this branch. Before rollout: review the paired PRs, establish canonical schema ownership, apply to isolated staging first, verify the capability receipt, drain old publication dispatch owners, quarantine unresolved legacy publications, then test a bounded authorised cohort. Never run old and new executors as competing owners of the same queue row. Rollback must preserve ledger-owned unknown states and must not replay the legacy queue.
+
+Remaining programme work includes connection lifecycle/version fences, billing inbox and entitlements, durable generation budgets, fair scheduling and typed UI recovery, provider restoration/compatibility, and account-authorised scheduled canaries. Do not describe the whole SaaS as production-repaired based on this publication slice alone.

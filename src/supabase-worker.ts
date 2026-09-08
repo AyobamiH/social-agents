@@ -9,6 +9,7 @@ import * as linkedin from './linkedin';
 import * as logger from './logger';
 import { activePlatformsFromSettings } from './platform-settings';
 import * as workerClaims from './worker-claims';
+import { executePublication, reconcilePublication, recoverStalePublications, PublicationPreflightError } from './publication-executor';
 import * as threads from './threads';
 import * as x from './x';
 import { buildDailyInventoryPlan, type DailyInventoryQueueRow } from './daily-inventory-planner';
@@ -403,7 +404,7 @@ const PUBLISH_UNKNOWN_STATE_CODE = 'unknown_publish_state';
 const PUBLISH_UNKNOWN_STATE_MESSAGE =
   'Scheduled publish timed out before the system could confirm whether the platform accepted the post. Review the platform account before retrying.';
 const PUBLISH_UNKNOWN_STATE_NEXT_ACTION =
-  'Check the platform account for a matching post. If it is not live, retry this queue item manually.';
+  'Do not retry or recreate this post. Reconcile the exact publication attempt first; absence from a search is not proof of rejection.';
 const PUBLISH_INTERRUPTED_CODE = 'publish_claim_interrupted';
 const PUBLISH_INTERRUPTED_MESSAGE =
   'Scheduled publish was interrupted before the platform publish step started. The queue item remains available for retry.';
@@ -3588,139 +3589,81 @@ async function assertOpenAIRepairAllowedForPublish(
   });
 }
 
-async function publishQueueRow(job: AgentJobRow, row: QueueItemRow, settings: UserSettingsRow): Promise<JsonMap> {
-  const locked = await supabaseUpdate<QueueItemRow>('queue_items', {
-    status: 'publishing',
-    error_message: null,
-  }, {
-    filters: [
-      { column: 'id', operator: 'eq', value: row.id },
-      { column: 'user_id', operator: 'eq', value: job.user_id },
-      { column: 'status', operator: 'in', value: ['pending', 'ready', 'failed'] },
-    ],
-    returning: true,
+async function publishQueueRow(job: AgentJobRow, row: QueueItemRow, _settings: UserSettingsRow): Promise<JsonMap> {
+  if (row.user_id !== job.user_id) throw new WorkerJobError('publication_tenant_mismatch');
+  // Reload per item. publish_all must not retain the first item's stale credentials/settings.
+  const tenant = await loadTenantContext(job.user_id);
+  return withTenantRuntime(tenant, async () => {
+    const execution = await executePublication({
+      userId: job.user_id, queueItemId: row.id, platform: row.platform,
+    }, {
+      prepare: async payload => {
+        // Disabled hosted publishers are rejected before token refresh or paid media work.
+        if (payload.platform === 'threads' || payload.platform === 'instagram') {
+          throw new PublicationPreflightError('legacy_meta_publication_disabled');
+        }
+        if (payload.platform === 'facebook') throw new PublicationPreflightError('facebook_paused');
+        let providerAccountRef: string;
+        if (payload.platform === 'x') {
+          if (payload.text.trim().length > 280) throw new PublicationPreflightError('x_text_too_long');
+          const verification = await x.verifyCredentials();
+          providerAccountRef = verification.accountId;
+        } else {
+          if (!config.LINKEDIN_TOKEN || !config.LINKEDIN_PERSON_URN) {
+            throw new PublicationPreflightError('linkedin_not_connected');
+          }
+          await refreshLinkedInCredentialForPublish(job.user_id);
+          providerAccountRef = config.LINKEDIN_PERSON_URN;
+        }
+        // Recheck entitlement/pause/enablement immediately before the dispatch boundary.
+        const entitlement = await loadEntitlement(job.user_id);
+        if (!entitlement.canWrite) throw new PublicationPreflightError('billing_inactive');
+        const settings = (await supabaseSelect<UserSettingsRow>('user_settings', {
+          filters: [{ column: 'user_id', operator: 'eq', value: job.user_id }], limit: 1,
+        }))[0] || {};
+        if (!activePlatformsFromSettings(settings).includes(payload.platform)) {
+          throw new PublicationPreflightError('platform_disabled');
+        }
+        if (jobOrigin(job) === 'scheduled') {
+          if (settings.automation_enabled !== true || settings.automation_publish_enabled !== true) {
+            throw new PublicationPreflightError('publish_automation_disabled');
+          }
+          // Schedule is frozen by the claimed intent. Content still comes only from payload.
+          const frozenQueue = (await supabaseSelect<QueueItemRow>('queue_items', {
+            select: 'id,user_id,scheduled_for',
+            filters: [{ column: 'id', operator: 'eq', value: row.id }, { column: 'user_id', operator: 'eq', value: job.user_id }],
+            limit: 1,
+          }))[0];
+          if (!frozenQueue || !(Date.parse(frozenQueue.scheduled_for) <= Date.now())) {
+            throw new PublicationPreflightError('publication_not_due');
+          }
+        }
+        const frozenRow: QueueItemRow = {
+          ...row, platform: payload.platform, draft_text: payload.text,
+          instagram_image_url: payload.instagram_image_url || null,
+          source_url: payload.source_url || null, source_title: payload.source_title || null,
+          angle: payload.angle || null, angle_record_id: payload.angle_record_id || null,
+        };
+        return {
+          providerAccountRef,
+          send: async () => ({ externalPostId: await publishPlatform(frozenRow) }),
+        };
+      },
+      afterAccepted: async (_attempt, payload) => {
+        if (payload.angle_record_id) {
+          await supabaseUpdate('angle_records', { status: 'published', last_used_at: nowIso() }, {
+            filters: [{ column: 'id', operator: 'eq', value: payload.angle_record_id }, { column: 'user_id', operator: 'eq', value: job.user_id }],
+          });
+        }
+      },
+    });
+    // Non-authoritative telemetry cannot change publication truth or trigger a resend.
+    try {
+      await writeWorkerLog(job.user_id, execution.outcome === 'accepted' || execution.outcome === 'verified' ? 'info' : 'warn',
+        'publication_result', { jobId: job.id, ...execution });
+    } catch { /* Durable ledger remains the source of truth. */ }
+    return execution;
   });
-
-  let current = locked[0];
-  if (!current) {
-    throw new WorkerJobError('queue_item_not_available', 'queue_item_not_available', { queueItemId: row.id });
-  }
-
-  try {
-    if (publishRequiresOpenAIMediaRepair(current)) {
-      await assertOpenAIRepairAllowedForPublish(job, current, settings);
-      const image = await ai.ensurePersistentInstagramImage({
-        imageUrl: current.instagram_image_url,
-        imagePrompt: current.instagram_image_prompt,
-        title: current.source_title || current.angle || 'Instagram post',
-        text: current.draft_text || '',
-      }, {
-        angleId: current.angle_record_id || undefined,
-        jobId: job.id,
-        jobKind: job.kind,
-        platform: current.platform,
-        queueItemId: current.id,
-        stage: 'instagram_publish_media_repair',
-        userId: job.user_id,
-      });
-      const patched = await supabaseUpdate<QueueItemRow>('queue_items', {
-        instagram_image_url: image.imageUrl,
-        instagram_image_prompt: current.instagram_image_prompt || image.imagePrompt,
-      }, {
-        filters: [
-          { column: 'id', operator: 'eq', value: current.id },
-          { column: 'user_id', operator: 'eq', value: job.user_id },
-        ],
-        returning: true,
-      });
-      current = patched[0] || {
-        ...current,
-        instagram_image_url: image.imageUrl,
-        instagram_image_prompt: current.instagram_image_prompt || image.imagePrompt,
-      };
-    }
-
-    if (current.platform === 'threads') {
-      await prepareThreadsCredentialForPublish(job.user_id);
-    }
-    if (current.platform === 'linkedin') {
-      await refreshLinkedInCredentialForPublish(job.user_id);
-    }
-    const authMode = current.platform === 'x'
-      ? await verifyXCredentialForPublish(job.user_id)
-      : undefined;
-    const externalPostId = await publishPlatform(current);
-    if (current.platform === 'linkedin') {
-      await markLinkedInCredentialVerified(job.user_id);
-    }
-    await supabaseUpdate('queue_items', {
-      status: 'published',
-      error_message: null,
-    }, {
-      filters: [
-        { column: 'id', operator: 'eq', value: current.id },
-        { column: 'user_id', operator: 'eq', value: job.user_id },
-      ],
-    });
-    const publishedAt = nowIso();
-    const publishHistoryRows = await supabaseInsert<PublishHistoryRow>('publish_history', {
-      user_id: job.user_id,
-      platform: current.platform,
-      post_text: current.draft_text || null,
-      external_post_id: externalPostId,
-      source_url: current.source_url || null,
-      published_at: publishedAt,
-    }, true);
-    const publishHistory = publishHistoryRows[0];
-    if (current.angle_record_id) {
-      await supabaseUpdate('angle_records', {
-        status: 'published',
-        last_used_at: nowIso(),
-      }, {
-        filters: [
-          { column: 'id', operator: 'eq', value: current.angle_record_id },
-          { column: 'user_id', operator: 'eq', value: job.user_id },
-        ],
-      });
-    }
-    await writeWorkerLog(job.user_id, 'info', 'published_queue_item', {
-      jobId: job.id,
-      queueItemId: current.id,
-      platform: current.platform,
-      ...(authMode ? { auth_mode: authMode } : {}),
-      externalPostId,
-      publishHistoryId: publishHistory?.id || null,
-    });
-    return publishSuccessResult(job, current, publishHistory, externalPostId, nowIso(), authMode);
-  } catch (error) {
-    const message = publicError(error);
-    const imageErrorContext = safeErrorContext(error);
-    if (current.platform === 'instagram' && imageErrorContext?.stage === ai.OPENAI_IMAGE_GENERATION_STAGE) {
-      await writeWorkerLog(job.user_id, 'warn', 'instagram_image_generation_failed', {
-        jobId: job.id,
-        queueItemId: current.id,
-        platform: current.platform,
-        ...imageErrorContext,
-      });
-    }
-    if (isPlatformPublishError(error)) {
-      await writeWorkerLog(job.user_id, 'warn', 'platform_publish_failed', {
-        jobId: job.id,
-        queueItemId: current.id,
-        ...platformErrorContext(error),
-      });
-    }
-    await supabaseUpdate('queue_items', {
-      status: 'failed',
-      error_message: message,
-    }, {
-      filters: [
-        { column: 'id', operator: 'eq', value: current.id },
-        { column: 'user_id', operator: 'eq', value: job.user_id },
-      ],
-    });
-    throw error;
-  }
 }
 
 async function handlePublishNow(job: AgentJobRow, tenant: TenantContext): Promise<JsonMap> {
@@ -3741,37 +3684,25 @@ async function handlePublishNow(job: AgentJobRow, tenant: TenantContext): Promis
 
 async function handlePublishAll(job: AgentJobRow, tenant: TenantContext): Promise<JsonMap> {
   const rows = await supabaseSelect<QueueItemRow>('queue_items', {
-    select: '*',
-    filters: [
-      { column: 'user_id', operator: 'eq', value: job.user_id },
-      { column: 'status', operator: 'in', value: ['pending', 'ready'] },
-    ],
-    order: 'scheduled_for.asc',
-    limit: 100,
+    filters: [{ column: 'user_id', operator: 'eq', value: job.user_id }, { column: 'status', operator: 'in', value: ['pending', 'ready'] }],
+    order: 'scheduled_for.asc', limit: 100,
   });
-
   const published: JsonMap[] = [];
   const failures: JsonMap[] = [];
   for (const row of rows) {
     try {
-      published.push(await publishQueueRow(job, row, tenant.settings));
-    } catch (error) {
-      failures.push({
-        queueItemId: row.id,
-        platform: row.platform,
-        error: publicError(error),
-      });
+      const outcome = await publishQueueRow(job, row, tenant.settings);
+      if (outcome.outcome === 'accepted' || outcome.outcome === 'verified') published.push(outcome);
+      else failures.push(outcome);
+    } catch {
+      failures.push({ queueItemId: row.id, platform: row.platform, failureCode: 'publication_execution_interrupted', nextAction: 'Reconcile the exact publication before retrying.' });
     }
   }
-
-  if (failures.length) {
-    throw new WorkerJobError('publish_all_failed', 'publish_all_failed', {
-      published,
-      failures,
-    });
-  }
-
-  return { published, failures };
+  const outcome = failures.length ? (published.length ? 'completed_with_errors' : 'blocked') : 'accepted';
+  return { published, failures, outcome,
+    jobStatus: failures.length ? (published.length ? 'completed_with_errors' : 'failed') : 'completed',
+    summary: { outcome, published, failures, errors: failures.map(item => item.failureCode) },
+  };
 }
 
 async function handleSkipSlot(job: AgentJobRow): Promise<JsonMap> {
@@ -4750,17 +4681,6 @@ function hasRecentJobActivity(logs: WorkerLogRow[], cutoffIso: string): boolean 
   });
 }
 
-function publishStageStarted(logs: WorkerLogRow[], queueItemId: string): boolean {
-  return logs.some(row => {
-    const context = logContext(row);
-    const loggedQueueItemId = logString(context, 'queueItemId');
-    if (loggedQueueItemId && loggedQueueItemId !== queueItemId) return false;
-    return row.message === 'published_queue_item'
-      || row.message === 'platform_publish_failed'
-      || row.message === 'instagram_image_generation_failed';
-  });
-}
-
 async function loadQueueItemForStalePublish(job: AgentJobRow, queueItemId: string): Promise<QueueItemRow | undefined> {
   return (await supabaseSelect<QueueItemRow>('queue_items', {
     select: 'id,user_id,platform,status,slot_index,scheduled_for,source_url,source_title,angle,error_message',
@@ -4772,144 +4692,16 @@ async function loadQueueItemForStalePublish(job: AgentJobRow, queueItemId: strin
   }))[0];
 }
 
-async function findPublishHistoryForQueueItem(
-  job: AgentJobRow,
-  row: QueueItemRow
-): Promise<PublishHistoryRow | undefined> {
-  if (!row.source_url) return undefined;
-  return (await supabaseSelect<PublishHistoryRow>('publish_history', {
-    select: 'id,user_id,platform,external_post_id,external_url,source_url,published_at',
-    filters: [
-      { column: 'user_id', operator: 'eq', value: job.user_id },
-      { column: 'platform', operator: 'eq', value: row.platform },
-      { column: 'source_url', operator: 'eq', value: row.source_url },
-      { column: 'published_at', operator: 'gte', value: job.started_at || job.created_at },
-    ],
-    order: 'published_at.desc',
-    limit: 1,
-  }))[0];
-}
+// Legacy source-URL/time history matching removed. Ledger recovery uses exact identities.
 
-function stalePublishResult(
-  job: AgentJobRow,
-  row: QueueItemRow | undefined,
-  history: PublishHistoryRow | undefined,
-  logs: WorkerLogRow[]
-): JsonMap {
+async function stalePublishJobResult(job: AgentJobRow, _logs: WorkerLogRow[]): Promise<JsonMap> {
   const queueItemId = queueItemIdFromPayload(job.payload);
-  if (!row) {
-    const message = 'Scheduled publish timed out, but the queue item no longer exists.';
-    const nextAction = 'Review Logs and publish history before retrying scheduled publishing.';
-    return {
-      outcome: 'blocked',
-      message,
-      nextAction,
-      error: 'queue_item_missing',
-      jobStatus: 'failed',
-      summary: {
-        outcome: 'blocked',
-        message,
-        nextAction,
-        failedStage: 'scheduled_publish',
-        failureCode: 'queue_item_missing',
-        queueItemId,
-        queueItemStatus: 'missing',
-        errors: ['queue_item_missing'],
-      },
-    };
-  }
-  const platform = row?.platform || 'unknown';
-  const externalPostId = String(history?.external_post_id || '').trim();
-  if (row.status === 'published' && history?.id && externalPostId) {
-    return publishSuccessResult(
-      job,
-      row,
-      history,
-      externalPostId,
-      history.published_at || nowIso()
-    );
-  }
-  const reconciled = row?.status === 'published' || Boolean(history);
-  const stageStarted = row?.status === 'publishing' || (queueItemId ? publishStageStarted(logs, queueItemId) : false);
-  const code = reconciled
-    ? PUBLISH_RECONCILED_CODE
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_CODE
-    : PUBLISH_INTERRUPTED_CODE;
-  const message = reconciled
-    ? PUBLISH_RECONCILED_MESSAGE
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_MESSAGE
-    : PUBLISH_INTERRUPTED_MESSAGE;
-  const nextAction = reconciled
-    ? PUBLISH_RECONCILED_NEXT_ACTION
-    : stageStarted
-    ? PUBLISH_UNKNOWN_STATE_NEXT_ACTION
-    : PUBLISH_INTERRUPTED_NEXT_ACTION;
-  const outcome = reconciled ? 'completed_with_errors' : 'blocked';
-
-  const summary: JsonMap = {
-    outcome,
-    message,
-    nextAction,
-    failedStage: reconciled ? 'publish_state_reconciliation' : stageStarted ? 'scheduled_publish' : 'publish_claim',
-    failureCode: code,
-    platform,
-    queueItemId,
-    queueItemStatus: row?.status || 'missing',
-    scheduledFor: row?.scheduled_for || null,
-    publishHistoryId: history?.id || null,
-    externalPostId: history?.external_post_id || null,
-    errors: [message],
+  const row = queueItemId ? await loadQueueItemForStalePublish(job, queueItemId) : undefined;
+  if (!row) return {
+    outcome: 'unknown', jobStatus: 'failed', failureCode: 'publication_queue_identity_missing',
+    summary: { outcome: 'unknown', failureCode: 'publication_queue_identity_missing', nextAction: 'Reconcile publication identity before retrying. Do not recreate the post.', errors: ['publication_queue_identity_missing'] },
   };
-
-  return {
-    outcome,
-    message,
-    nextAction,
-    error: code,
-    jobStatus: reconciled ? 'completed_with_errors' : 'failed',
-    summary,
-  };
-}
-
-async function stalePublishJobResult(job: AgentJobRow, logs: WorkerLogRow[]): Promise<JsonMap> {
-  const queueItemId = queueItemIdFromPayload(job.payload);
-  if (!queueItemId) {
-    return {
-      outcome: 'blocked',
-      message: 'Scheduled publish timed out and did not include a queue item id.',
-      nextAction: 'Review the job payload before retrying scheduled publishing.',
-      error: 'missing_queue_item_id',
-      jobStatus: 'failed',
-      summary: {
-        outcome: 'blocked',
-        message: 'Scheduled publish timed out and did not include a queue item id.',
-        nextAction: 'Review the job payload before retrying scheduled publishing.',
-        failedStage: 'scheduled_publish',
-        failureCode: 'missing_queue_item_id',
-        errors: ['missing_queue_item_id'],
-      },
-    };
-  }
-
-  const row = await loadQueueItemForStalePublish(job, queueItemId);
-  const history = row ? await findPublishHistoryForQueueItem(job, row) : undefined;
-  const result = stalePublishResult(job, row, history, logs);
-  const summary = resultSummary(result);
-  if (row && summary.failureCode === PUBLISH_UNKNOWN_STATE_CODE) {
-    await supabaseUpdate('queue_items', {
-      status: 'failed',
-      error_message: PUBLISH_UNKNOWN_STATE_MESSAGE,
-    }, {
-      filters: [
-        { column: 'id', operator: 'eq', value: row.id },
-        { column: 'user_id', operator: 'eq', value: job.user_id },
-        { column: 'status', operator: 'eq', value: 'publishing' },
-      ],
-    });
-  }
-  return result;
+  return reconcilePublication({ userId: job.user_id, queueItemId: row.id, platform: row.platform });
 }
 
 async function cleanupStaleRunningJobs(stats: SchedulerStats, now: Date): Promise<void> {
@@ -4988,6 +4780,7 @@ export async function runSupabaseAutomationScheduler(): Promise<SchedulerStats> 
     skipped: {},
   };
   const now = new Date();
+  await recoverStalePublications(now.getTime());
   await cleanupStaleRunningJobs(stats, now);
   await enqueueDueFetchJobs(stats, now);
   await enqueueDueSlotFillJobs(stats, now);
@@ -5096,6 +4889,9 @@ export function startSupabaseWorkerLoop(log = logger): { stop: () => void } | un
 }
 
 export const __test__ = {
+  publishQueueRow,
+  stalePublishJobResult,
+  handlePublishAll,
   buildOpenAIUsageDailySummary,
   contentStrategyPromptOptions,
   draftCreationPreflightForAngle,
@@ -5122,7 +4918,6 @@ export const __test__ = {
   sourceIntentFor,
   sourceIntentRejectReasons,
   sourceScopeFor,
-  stalePublishResult,
 };
 
 if (typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module) {

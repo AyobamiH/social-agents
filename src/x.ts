@@ -287,7 +287,8 @@ async function apiRequestWithAuth<T>(
   if (
     authMode === 'oauth2-user'
     && hasOAuth2RefreshConfig()
-    && classifyXError(response.message) === 'auth'
+    && method === 'GET'
+    && response.status === 401
   ) {
     token = await refreshAndPersistOAuth2AccessToken();
     response = await sendApiRequest<T>(method, path, authMode, payload, token);
@@ -309,7 +310,12 @@ async function apiRequestWithAuth<T>(
   }
 
   if (response.status >= 400 || response.data.errors || response.data.error || response.data.detail) {
-    throw new Error('X API: ' + response.message);
+    throw new PlatformPublishError({
+      platform: 'x', stage: payload ? 'post' : 'credential_check',
+      code: 'platform_api_error', status: response.status,
+      userMessage: 'X returned a non-success response.',
+      nextAction: 'Review the exact attempt before any further publish.',
+    });
   }
 
   return response.data;

@@ -189,7 +189,9 @@ export function publish(text: string): Promise<string> {
     timeoutMs: config.HTTP_TIMEOUT_MS,
   }).then(({ status, headers, data, rawText }) => {
     if (status === 201) {
-      return data.id || 'posted';
+      const id = data.id || headers.get('x-restli-id');
+      if (typeof id !== 'string' || !id.trim()) throw new Error('LinkedIn acceptance receipt missing');
+      return id;
     }
     throw normalizeLinkedInError('post', status, headers.get('content-type'), rawText, data);
   }).catch(error => {
