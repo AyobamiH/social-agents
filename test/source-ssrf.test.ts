@@ -75,7 +75,7 @@ async function main(): Promise<void> {
     assert.match(worker, /const PROCESSABLE_SOURCE_RECORD_ORIGINS = \[\s*'manual',\s*'authenticated_browser',\s*\] as const/);
     assert.match(sourceRecordBody, /operator: 'in', value: \[\.\.\.PROCESSABLE_SOURCE_RECORD_ORIGINS\]/);
     assert.match(sourceRecordBody, /source_text/);
-    assert.match(sourceRecordBody, /isProcessableSourceRecordForAngleExtraction\(record, sourceUrlsWithAngles\)/);
+    assert.match(sourceRecordBody, /isProcessableSourceRecordForAngleExtraction\((?:record|candidate), sourceUrlsWithAngles\)/);
     assert.match(sourceRecordBody, /extractSourceBankWithJobTimeout/);
     assert.match(sourceRecordBody, /queueFromBankedAngles/);
     assert.match(sourceRecordBody, /source_record_selected_for_angle_extraction/);

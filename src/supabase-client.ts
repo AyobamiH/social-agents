@@ -20,6 +20,14 @@ export interface SupabaseMutationOptions {
   returning?: boolean;
 }
 
+export interface SupabaseRpcOptions {
+  /**
+   * Allows network retries only when the RPC contract itself is idempotent for
+   * the exact request body. Ordinary database writes must leave this false.
+   */
+  retrySafe?: boolean;
+}
+
 export class SupabaseRestError extends Error {
   constructor(
     message: string,
@@ -85,11 +93,17 @@ function describeCause(error: unknown): string | undefined {
   return undefined;
 }
 
-async function fetchSupabase(url: string | URL, init: RequestInit, table: string, operation: string): Promise<Response> {
-  const maxAttempts = 3;
+async function fetchSupabase(
+  url: string | URL,
+  init: RequestInit,
+  table: string,
+  operation: string,
+  maxAttempts: number
+): Promise<Response> {
+  const attempts = Math.max(1, maxAttempts);
   let lastError: unknown;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       return await fetch(url, {
         ...init,
@@ -97,7 +111,7 @@ async function fetchSupabase(url: string | URL, init: RequestInit, table: string
       });
     } catch (error) {
       lastError = error;
-      if (attempt < maxAttempts) {
+      if (attempt < attempts) {
         await sleep(500 * attempt);
       }
     }
@@ -107,7 +121,7 @@ async function fetchSupabase(url: string | URL, init: RequestInit, table: string
   const causeDetails = describeCause(lastError);
   const suffix = causeDetails ? ` | cause: ${causeDetails}` : '';
   throw new SupabaseNetworkError(
-    `Supabase ${operation} ${table} network request failed at ${endpoint} after ${maxAttempts} attempts${suffix}`,
+    `Supabase ${operation} ${table} network request failed at ${endpoint} after ${attempts} attempt${attempts === 1 ? '' : 's'}${suffix}`,
     table,
     operation,
     endpoint,
@@ -166,7 +180,7 @@ export async function supabaseSelect<T>(
 
   const response = await fetchSupabase(url, {
     headers: serviceHeaders(),
-  }, table, 'select');
+  }, table, 'select', 3);
   return parseResponse<T[]>(response, table);
 }
 
@@ -183,7 +197,7 @@ export async function supabaseInsert<T>(
       Prefer: returning ? 'return=representation' : 'return=minimal',
     }),
     body: JSON.stringify(body),
-  }, table, 'insert');
+  }, table, 'insert', 1);
   return parseResponse<T[]>(response, table);
 }
 
@@ -205,7 +219,7 @@ export async function supabaseUpsert<T>(
       ].join(','),
     }),
     body: JSON.stringify(body),
-  }, table, 'upsert');
+  }, table, 'upsert', 1);
   return parseResponse<T[]>(response, table);
 }
 
@@ -223,7 +237,7 @@ export async function supabaseUpdate<T>(
       Prefer: options.returning ? 'return=representation' : 'return=minimal',
     }),
     body: JSON.stringify(body),
-  }, table, 'update');
+  }, table, 'update', 1);
   return parseResponse<T[]>(response, table);
 }
 
@@ -238,6 +252,26 @@ export async function supabaseDelete<T>(
     headers: serviceHeaders({
       Prefer: options.returning ? 'return=representation' : 'return=minimal',
     }),
-  }, table, 'delete');
+  }, table, 'delete', 1);
   return parseResponse<T[]>(response, table);
+}
+
+export async function supabaseRpc<T>(
+  functionName: string,
+  body: Record<string, unknown> = {},
+  options: SupabaseRpcOptions = {}
+): Promise<T> {
+  if (!/^[a-z0-9_]+$/.test(functionName)) {
+    throw new Error(`Invalid Supabase RPC function name: ${functionName}`);
+  }
+
+  const url = `${baseUrl()}/rpc/${functionName}`;
+  const response = await fetchSupabase(url, {
+    method: 'POST',
+    headers: serviceHeaders({
+      'Content-Type': 'application/json',
+    }),
+    body: JSON.stringify(body),
+  }, `rpc/${functionName}`, 'rpc', options.retrySafe ? 3 : 1);
+  return parseResponse<T>(response, `rpc/${functionName}`);
 }
