@@ -172,6 +172,7 @@ interface QueueItemRow {
   retry_of?: string | null;
   recovery_execution_id?: string | null;
   recovery_reason?: string | null;
+  legacy_revision_hold_id?: string | null;
 }
 
 interface PublishHistoryRow {
@@ -469,6 +470,26 @@ class WorkerJobError extends Error {
   ) {
     super(message);
   }
+}
+
+const LEGACY_QUEUE_REVISION_HELD_CODE = 'legacy_queue_revision_held';
+const LEGACY_QUEUE_REVISION_HELD_MESSAGE =
+  'This historical queue revision is protected because its publication outcome cannot be proven safely.';
+const LEGACY_QUEUE_REVISION_HELD_NEXT_ACTION =
+  'Do not retry, edit, skip, release, or recreate this post. Preserve it for operator review.';
+
+function assertQueueRevisionNotHeld(
+  row: Pick<QueueItemRow, 'id' | 'legacy_revision_hold_id'>
+): void {
+  if (!row.legacy_revision_hold_id) return;
+  throw new WorkerJobError(
+    LEGACY_QUEUE_REVISION_HELD_CODE,
+    LEGACY_QUEUE_REVISION_HELD_MESSAGE,
+    {
+      queueItemId: row.id,
+      next_action: LEGACY_QUEUE_REVISION_HELD_NEXT_ACTION,
+    }
+  );
 }
 
 interface SourceRecordRow {
@@ -3591,6 +3612,7 @@ async function assertOpenAIRepairAllowedForPublish(
 
 async function publishQueueRow(job: AgentJobRow, row: QueueItemRow, _settings: UserSettingsRow): Promise<JsonMap> {
   if (row.user_id !== job.user_id) throw new WorkerJobError('publication_tenant_mismatch');
+  assertQueueRevisionNotHeld(row);
   // Reload per item. publish_all must not retain the first item's stale credentials/settings.
   const tenant = await loadTenantContext(job.user_id);
   return withTenantRuntime(tenant, async () => {
@@ -3724,6 +3746,13 @@ async function handleSkipSlot(job: AgentJobRow): Promise<JsonMap> {
     throw new WorkerJobError('missing_queue_target', 'queue_item_id or slot_index is required');
   }
 
+  const targets = await supabaseSelect<QueueItemRow>('queue_items', {
+    select: 'id,user_id,legacy_revision_hold_id',
+    filters,
+    limit: 100,
+  });
+  targets.forEach(assertQueueRevisionNotHeld);
+
   const rows = await supabaseUpdate<QueueItemRow>('queue_items', {
     status: 'skipped',
     error_message: null,
@@ -3763,6 +3792,13 @@ async function handleReleaseSlot(job: AgentJobRow): Promise<JsonMap> {
   if (!queueItemId && slotIndex === undefined) {
     throw new WorkerJobError('missing_queue_target', 'queue_item_id or slot_index is required');
   }
+
+  const targets = await supabaseSelect<QueueItemRow>('queue_items', {
+    select: 'id,user_id,legacy_revision_hold_id',
+    filters,
+    limit: 100,
+  });
+  targets.forEach(assertQueueRevisionNotHeld);
 
   const rows = await supabaseDelete<QueueItemRow>('queue_items', {
     filters,
@@ -4248,7 +4284,7 @@ async function loadPriorFailedRecovery(row: QueueItemRow): Promise<QueueItemRow 
 async function enqueueDuePublishJobs(stats: SchedulerStats, now: Date): Promise<void> {
   const settingsByUser = await loadAutomationSettingsByUser();
   const dueRows = await supabaseSelect<QueueItemRow>('queue_items', {
-    select: 'id,user_id,platform,status,slot_index,scheduled_for,scheduled_local_date,scheduled_timezone,retry_of,recovery_execution_id',
+    select: 'id,user_id,platform,status,slot_index,scheduled_for,scheduled_local_date,scheduled_timezone,retry_of,recovery_execution_id,legacy_revision_hold_id',
     filters: [
       { column: 'status', operator: 'in', value: ['pending', 'ready'] },
       { column: 'scheduled_for', operator: 'lte', value: now.toISOString() },
@@ -4258,6 +4294,19 @@ async function enqueueDuePublishJobs(stats: SchedulerStats, now: Date): Promise<
   });
 
   for (const row of dueRows) {
+    if (row.legacy_revision_hold_id) {
+      incrementSchedulerSkip(stats, LEGACY_QUEUE_REVISION_HELD_CODE);
+      await recordAutomationSkip(
+        row.user_id,
+        'publish_now',
+        LEGACY_QUEUE_REVISION_HELD_CODE,
+        LEGACY_QUEUE_REVISION_HELD_MESSAGE,
+        LEGACY_QUEUE_REVISION_HELD_NEXT_ACTION,
+        { queueItemId: row.id, platform: row.platform }
+      );
+      continue;
+    }
+
     const settings = settingsByUser.get(row.user_id);
     if (!settings || !settings.automation_publish_enabled) {
       incrementSchedulerSkip(stats, 'publish_automation_disabled');
@@ -4889,6 +4938,7 @@ export function startSupabaseWorkerLoop(log = logger): { stop: () => void } | un
 }
 
 export const __test__ = {
+  assertQueueRevisionNotHeld,
   publishQueueRow,
   stalePublishJobResult,
   handlePublishAll,
