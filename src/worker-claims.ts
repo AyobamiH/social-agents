@@ -11,6 +11,7 @@ export const REQUIRED_WORKER_CLAIM_CAPABILITIES = [
   'source-angle-atomic-commit-v1',
   'angle-queue-atomic-commit-v1',
   'queue-angle-identity-v1',
+  'legacy-queue-revision-hold-v1',
 ] as const;
 
 export interface WorkerSchemaContract {
