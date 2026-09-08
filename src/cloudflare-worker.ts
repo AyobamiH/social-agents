@@ -15,6 +15,10 @@ interface Env {
   SERVICE_ROLE_KEY?: string;
   CREDENTIAL_ENCRYPTION_KEY?: string;
   SUPABASE_WORKER_BATCH_SIZE?: string;
+  SUPABASE_WORKER_CANARY_REQUIRED?: string;
+  SUPABASE_WORKER_CANARY_USER_IDS?: string;
+  SUPABASE_WORKER_GENERATION_ENABLED?: string;
+  SUPABASE_PROVIDER_DISPATCH_ENABLED?: string;
   DAILY_INVENTORY_PLANNER_ENABLED?: string;
   DAILY_INVENTORY_PLANNER_START_LOCAL_DATE?: string;
   HTTP_TIMEOUT_MS?: string;
@@ -87,8 +91,25 @@ function publicationCapabilities(): Record<string, { state: string; code: string
   };
 }
 
+function booleanBinding(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+function canaryUserCount(value: string | undefined): number {
+  return new Set(
+    String(value || '')
+      .split(',')
+      .map(item => item.trim().toLowerCase())
+      .filter(Boolean)
+  ).size;
+}
+
 function healthPayload(env: Env): Record<string, unknown> {
   const metadata = env.CF_VERSION_METADATA;
+  const production = env.NODE_ENV === 'production';
+  const canaryRequired = production || booleanBinding(env.SUPABASE_WORKER_CANARY_REQUIRED, false);
+  const allowedTenantCount = canaryUserCount(env.SUPABASE_WORKER_CANARY_USER_IDS);
   return {
     ok: true,
     liveness: 'ok',
@@ -104,6 +125,17 @@ function healthPayload(env: Env): Record<string, unknown> {
       appliedSchema: 'unverified',
     },
     publicationCapabilities: publicationCapabilities(),
+    rollout: {
+      tenantScope: canaryRequired
+        ? allowedTenantCount > 0
+          ? 'allowlisted'
+          : 'blocked_empty_allowlist'
+        : 'unrestricted',
+      canaryRequired,
+      allowedTenantCount,
+      generationEnabled: booleanBinding(env.SUPABASE_WORKER_GENERATION_ENABLED, !production),
+      providerDispatchEnabled: booleanBinding(env.SUPABASE_PROVIDER_DISPATCH_ENABLED, !production),
+    },
     executionGate: scheduledTickGate.snapshot(),
   };
 }

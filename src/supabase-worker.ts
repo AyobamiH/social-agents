@@ -8,6 +8,12 @@ import * as instagram from './instagram';
 import * as linkedin from './linkedin';
 import * as logger from './logger';
 import { activePlatformsFromSettings } from './platform-settings';
+import {
+  allowedCanaryUserIds,
+  rolloutBlockCode,
+  runnableJobKinds,
+  type RolloutPolicy,
+} from './canary-policy';
 import * as workerClaims from './worker-claims';
 import { executePublication, reconcilePublication, recoverStalePublications, PublicationPreflightError } from './publication-executor';
 import * as threads from './threads';
@@ -539,6 +545,29 @@ const SUPPORTED_JOB_KINDS = new Set<JobKind>([
   'skip_slot',
   'release_slot',
 ]);
+
+function rolloutPolicy(): RolloutPolicy {
+  return {
+    canaryRequired: config.SUPABASE_WORKER_CANARY_REQUIRED,
+    canaryUserIds: config.SUPABASE_WORKER_CANARY_USER_IDS,
+    generationEnabled: config.SUPABASE_WORKER_GENERATION_ENABLED,
+    providerDispatchEnabled: config.SUPABASE_PROVIDER_DISPATCH_ENABLED,
+  };
+}
+
+function rolloutAllowedUserIds(): string[] | undefined {
+  return allowedCanaryUserIds(rolloutPolicy());
+}
+
+function assertRolloutAllowsJob(userId: string, kind: JobKind): void {
+  const code = rolloutBlockCode(rolloutPolicy(), userId, kind);
+  if (!code) return;
+  throw new WorkerJobError(code, code, {
+    kind,
+    userId,
+    next_action: 'Change the reviewed rollout controls before this job may execute.',
+  });
+}
 
 const ACTIVE_QUEUE_STATUSES = ['pending', 'ready', 'publishing'];
 const ACTIVE_ANGLE_STATUSES: AngleRecordStatus[] = ['unused', 'in_progress'];
@@ -2115,9 +2144,21 @@ function assertSupportedJobKind(kind: string): asserts kind is JobKind {
 }
 
 async function listPendingJobs(): Promise<AgentJobRow[]> {
+  const policy = rolloutPolicy();
+  const allowedUserIds = allowedCanaryUserIds(policy);
+  if (allowedUserIds?.length === 0) return [];
+  const kinds = runnableJobKinds(policy);
+  if (!kinds.length) return [];
+
   return supabaseSelect<AgentJobRow>('agent_jobs', {
     select: '*',
-    filters: [{ column: 'status', operator: 'eq', value: 'pending' }],
+    filters: [
+      { column: 'status', operator: 'eq', value: 'pending' },
+      { column: 'kind', operator: 'in', value: kinds },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
+    ],
     order: 'created_at.asc',
     limit: Math.max(1, Math.min(config.SUPABASE_WORKER_BATCH_SIZE || 10, 50)),
   });
@@ -3441,6 +3482,9 @@ async function queueFromBankedAngles(
 }
 
 async function handleRefreshQueue(job: AgentJobRow, tenant: TenantContext): Promise<JsonMap> {
+  if (!config.SUPABASE_WORKER_GENERATION_ENABLED) {
+    throw new WorkerJobError('rollout_generation_disabled');
+  }
   const sources = await supabaseSelect<UserSourceRow>('user_sources', {
     select: '*',
     filters: [{ column: 'user_id', operator: 'eq', value: job.user_id }],
@@ -3620,6 +3664,9 @@ async function publishQueueRow(job: AgentJobRow, row: QueueItemRow, _settings: U
       userId: job.user_id, queueItemId: row.id, platform: row.platform,
     }, {
       prepare: async payload => {
+        if (!config.SUPABASE_PROVIDER_DISPATCH_ENABLED) {
+          throw new PublicationPreflightError('rollout_provider_dispatch_disabled');
+        }
         // Disabled hosted publishers are rejected before token refresh or paid media work.
         if (payload.platform === 'threads' || payload.platform === 'instagram') {
           throw new PublicationPreflightError('legacy_meta_publication_disabled');
@@ -3938,11 +3985,17 @@ async function recordAutomationSkip(
 }
 
 async function enqueueDueFetchJobs(stats: SchedulerStats, now: Date): Promise<void> {
+  if (!config.SUPABASE_WORKER_GENERATION_ENABLED) return;
+  const allowedUserIds = rolloutAllowedUserIds();
+  if (allowedUserIds?.length === 0) return;
   const settingsRows = await supabaseSelect<AutomationSettingsRow>('user_settings', {
     select: '*',
     filters: [
       { column: 'automation_enabled', operator: 'eq', value: true },
       { column: 'automation_fetch_enabled', operator: 'eq', value: true },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
     ],
     limit: 200,
   });
@@ -4089,11 +4142,17 @@ async function recordDailyInventoryAlert(
 }
 
 async function enqueueDueSlotFillJobs(stats: SchedulerStats, now: Date): Promise<void> {
+  if (!config.SUPABASE_WORKER_GENERATION_ENABLED) return;
+  const allowedUserIds = rolloutAllowedUserIds();
+  if (allowedUserIds?.length === 0) return;
   const settingsRows = await supabaseSelect<AutomationSettingsRow>('user_settings', {
     select: '*',
     filters: [
       { column: 'automation_enabled', operator: 'eq', value: true },
       { column: 'automation_publish_enabled', operator: 'eq', value: true },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
     ],
     limit: 200,
   });
@@ -4257,9 +4316,16 @@ async function enqueueDueSlotFillJobs(stats: SchedulerStats, now: Date): Promise
 }
 
 async function loadAutomationSettingsByUser(): Promise<Map<string, AutomationSettingsRow>> {
+  const allowedUserIds = rolloutAllowedUserIds();
+  if (allowedUserIds?.length === 0) return new Map();
   const rows = await supabaseSelect<AutomationSettingsRow>('user_settings', {
     select: '*',
-    filters: [{ column: 'automation_enabled', operator: 'eq', value: true }],
+    filters: [
+      { column: 'automation_enabled', operator: 'eq', value: true },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
+    ],
     limit: 500,
   });
   return new Map(rows.map(row => [row.user_id, row]));
@@ -4282,12 +4348,18 @@ async function loadPriorFailedRecovery(row: QueueItemRow): Promise<QueueItemRow 
 }
 
 async function enqueueDuePublishJobs(stats: SchedulerStats, now: Date): Promise<void> {
+  if (!config.SUPABASE_PROVIDER_DISPATCH_ENABLED) return;
+  const allowedUserIds = rolloutAllowedUserIds();
+  if (allowedUserIds?.length === 0) return;
   const settingsByUser = await loadAutomationSettingsByUser();
   const dueRows = await supabaseSelect<QueueItemRow>('queue_items', {
     select: 'id,user_id,platform,status,slot_index,scheduled_for,scheduled_local_date,scheduled_timezone,retry_of,recovery_execution_id,legacy_revision_hold_id',
     filters: [
       { column: 'status', operator: 'in', value: ['pending', 'ready'] },
       { column: 'scheduled_for', operator: 'lte', value: now.toISOString() },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
     ],
     order: 'scheduled_for.asc',
     limit: 100,
@@ -4754,12 +4826,17 @@ async function stalePublishJobResult(job: AgentJobRow, _logs: WorkerLogRow[]): P
 }
 
 async function cleanupStaleRunningJobs(stats: SchedulerStats, now: Date): Promise<void> {
+  const allowedUserIds = rolloutAllowedUserIds();
+  if (allowedUserIds?.length === 0) return;
   const cutoff = addMinutesIso(now, -STALE_RUNNING_JOB_MINUTES);
   const jobs = await supabaseSelect<AgentJobRow>('agent_jobs', {
     select: '*',
     filters: [
       { column: 'status', operator: 'eq', value: 'running' },
       { column: 'started_at', operator: 'lte', value: cutoff },
+      ...(allowedUserIds
+        ? [{ column: 'user_id', operator: 'in' as const, value: allowedUserIds }]
+        : []),
     ],
     order: 'started_at.asc',
     limit: 50,
@@ -4829,7 +4906,7 @@ export async function runSupabaseAutomationScheduler(): Promise<SchedulerStats> 
     skipped: {},
   };
   const now = new Date();
-  await recoverStalePublications(now.getTime());
+  await recoverStalePublications(now.getTime(), rolloutAllowedUserIds());
   await cleanupStaleRunningJobs(stats, now);
   await enqueueDueFetchJobs(stats, now);
   await enqueueDueSlotFillJobs(stats, now);
@@ -4839,6 +4916,7 @@ export async function runSupabaseAutomationScheduler(): Promise<SchedulerStats> 
 
 async function handleClaimedJob(job: AgentJobRow): Promise<JsonMap> {
   assertSupportedJobKind(job.kind);
+  assertRolloutAllowsJob(job.user_id, job.kind);
   await assertTenantEntitlement(job);
   const tenant = await loadTenantContext(job.user_id);
   const kind = job.kind as JobKind;
