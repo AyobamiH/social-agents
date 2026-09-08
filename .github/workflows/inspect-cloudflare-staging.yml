@@ -1,0 +1,71 @@
+name: Inspect Cloudflare staging access
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [release/inspect-staging-access-20260908]
+    paths: ['.github/workflows/inspect-cloudflare-staging.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.repository == 'OneClickPostFactory/social-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Read existing account resources without exposing credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          node --input-type=module <<'NODE'
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const account = process.env.CLOUDFLARE_ACCOUNT_ID;
+          if (!token || !account) {
+            console.log(JSON.stringify({ access: 'blocked', token_configured: Boolean(token), account_configured: Boolean(account) }));
+            process.exit(1);
+          }
+          if (!/^[a-f0-9]{32}$/i.test(account)) {
+            console.log('Configured account identifier is invalid.');
+            process.exit(1);
+          }
+          let failed = false;
+          for (const resource of ['workers/scripts', 'containers/applications']) {
+            try {
+              const response = await fetch('https://api.cloudflare.com/client/v4/accounts/' + account + '/' + resource, {
+                method: 'GET',
+                redirect: 'error',
+                headers: { Authorization: 'Bearer ' + token },
+                signal: AbortSignal.timeout(20000)
+              });
+              const body = await response.json();
+              if (!response.ok || body.success === false) {
+                console.log(JSON.stringify({ resource, status: response.status, error_codes: (body.errors || []).map(e => e.code).filter(c => typeof c === 'number') }));
+                failed = true;
+                continue;
+              }
+              const rows = Array.isArray(body.result) ? body.result : Array.isArray(body) ? body : null;
+              if (!rows) {
+                console.log(JSON.stringify({ resource, status: response.status, result: 'unrecognised_shape' }));
+                failed = true;
+                continue;
+              }
+              console.log(JSON.stringify({
+                resource,
+                status: response.status,
+                returned_count: rows.length,
+                pagination: body.result_info ? { page: body.result_info.page, total_pages: body.result_info.total_pages, total_count: body.result_info.total_count } : null,
+                matching_resources: rows.filter(r => /oneclick|social.agents|staging/i.test(resource === 'workers/scripts' ? r.id : r.name || '')).map(r => ({
+                  name: resource === 'workers/scripts' ? r.id : r.name,
+                  ...(resource === 'containers/applications' ? { instances: r.instances, max_instances: r.max_instances } : {})
+                }))
+              }));
+            } catch {
+              console.log(JSON.stringify({ resource, access: 'request_failed' }));
+              failed = true;
+            }
+          }
+          process.exitCode = failed ? 1 : 0;
+          NODE
