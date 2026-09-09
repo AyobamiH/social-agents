@@ -58,7 +58,8 @@ interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
 }
 
-const SCHEMA_CONTRACT = 'pre-publication-ledger-v1';
+const WORKER_SCHEMA_CONTRACT = 'worker-claims-v1';
+const PUBLICATION_SCHEMA_CONTRACT = 'publication-ledger-v1';
 const scheduledTickGate = createExclusiveRunGate();
 
 function canonicalGitSha(versionTag: string | undefined): string | null {
@@ -121,8 +122,12 @@ function healthPayload(env: Env): Record<string, unknown> {
       versionTag: metadata?.tag || null,
       gitSha: canonicalGitSha(metadata?.tag),
       versionTimestamp: metadata?.timestamp || null,
-      schemaContract: SCHEMA_CONTRACT,
-      appliedSchema: 'unverified',
+      schemaContract: PUBLICATION_SCHEMA_CONTRACT,
+      schemaContracts: {
+        workerClaims: WORKER_SCHEMA_CONTRACT,
+        publicationLedger: PUBLICATION_SCHEMA_CONTRACT,
+      },
+      appliedSchema: 'not_evaluated',
     },
     publicationCapabilities: publicationCapabilities(),
     rollout: {

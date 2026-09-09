@@ -80,6 +80,11 @@ function main(): void {
   );
   assert.match(workflow, /SUPABASE_WORKER_CANARY_USER_IDS/);
   assert.match(workflow, /--secrets-file/);
+  assert.match(workflow, /wrangler deploy --env=""/);
+  assert.match(workflow, /Verify the exact fail-closed canary release/);
+  assert.match(workflow, /oneclickpostfactory-agent\.woeinvests\.workers\.dev\/healthz/);
+  assert.match(workflow, /body\.release\?\.gitSha !== expectedSha/);
+  assert.match(workflow, /rollout\.providerDispatchEnabled !== false/);
 
   console.log('Canary rollout policy tests passed.');
 }

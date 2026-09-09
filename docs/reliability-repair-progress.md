@@ -1,12 +1,12 @@
 # Reliability repair progress
 
-This file records implementation status, not production deployment or provider readiness. The final exact-SHA CI receipts are recorded on the relevant pull requests. A passing component test is not live account evidence.
+This file records implementation and rollout status. Exact-SHA CI receipts remain on the relevant pull requests and deployment runs. A passing component test is not live account evidence.
 
 ## Sequence 1: release identity and complete CI gate
 
 Merged to upstream through PR #2. `npm run ci` gates typecheck, the complete normal regression suite and the compiled-runtime smoke check. Deployment invokes that same gate. Cloudflare version metadata and the Git SHA are exposed separately from provider readiness.
 
-Hosted Threads and Instagram remain unavailable; Facebook remains paused; LinkedIn compatibility is unverified; X requires a tenant-owned connection. No production deployment is claimed here.
+Hosted Threads and Instagram remain unavailable; Facebook remains paused; LinkedIn compatibility is unverified; X requires a tenant-owned connection. The bounded production canary receipt is recorded below.
 
 ## D03 containment and async runtime isolation
 
@@ -20,17 +20,17 @@ This addresses cross-execution process-global leakage. It is not a claim that ev
 
 ## D22: explicit platform activation
 
-Present in this branch: only exact persisted boolean `true` enables a platform. Missing rows, fields, null and false fail closed. The schema-owner bootstrap also contains default-false settings and matching UI semantics. Existing legacy true values are not mass-rewritten because their original intent cannot be inferred safely.
+Merged to upstream through PR #5: only exact persisted boolean `true` enables a platform. Missing rows, fields, null and false fail closed. The schema-owner bootstrap also contains default-false settings and matching UI semantics. Existing legacy true values are not mass-rewritten because their original intent cannot be inferred safely.
 
 ## D04/D05/D06: source and angle claims and safe transport
 
-This branch is stacked on `codex/atomic-worker-claims`, head `984d0afa1fdfd696153fa8615615b1e2d42596e3`. That dependency introduces the typed worker-claims contract, database-owned source/angle leases and fencing, atomic generation finalisation, and explicit Supabase RPC retry semantics.
+Merged into upstream through the dependency chain completed by PR #9. The worker-claims layer introduces the typed worker-claims contract, database-owned source/angle leases and fencing, atomic generation finalisation, and explicit Supabase RPC retry semantics.
 
 Ordinary ambiguous mutations are single-attempt. Only reads and RPCs whose exact request identities are designed to be idempotent opt into retries. This does not claim that every agent job/enqueue path already has durable uniqueness or fencing.
 
 ## D07/D08/D09: connected publication execution
 
-The hosted Worker consumer is now wired in `codex/publication-ledger-v1`, fork PR `AyobamiH/social-agents#4`, not merely a collection of unused helper modules.
+The hosted Worker consumer is wired and merged to upstream through PR #9, not merely a collection of unused helper modules.
 
 ### Execution boundary
 
@@ -71,8 +71,12 @@ The cross-repository integration workflow belongs to the private schema-owner re
 
 The one-time hash-guarded source-edit workflow and script were removed after committing the source delta. No write-enabled test/codemod workflow remains from this cutover.
 
-## Production remains gated
+## Production limited canary
 
-Neither schema nor consumer is deployed by this branch. Before rollout: review the paired PRs, establish canonical schema ownership, apply to isolated staging first, verify the capability receipt, drain old publication dispatch owners, quarantine unresolved legacy publications, then test a bounded authorised cohort. Never run old and new executors as competing owners of the same queue row. Rollback must preserve ledger-owned unknown states and must not replay the legacy queue.
+The schema-first rollout reached production on 9 September 2026 after the paired schema and Worker changes merged. Production migration head `20260907055000` preserves 148 queue rows while quarantining 11 members of five historical conflict groups behind immutable legacy revision holds. The persistent WSL staging rehearsal passed all 16 real Supabase/Postgres failure scenarios with provider transport intercepted and zero live posts.
+
+Upstream PR #9 merged as `3a27a993742151a6558089c9ab0ade6b1a762ba4`. Guarded deployment run #79 then passed complete CI and deployed Cloudflare Worker version `773bb17d-59ef-484d-ae74-2f7c004e3447` with a one-tenant allowlist, batch size one, generation disabled and provider dispatch disabled. A post-deployment production snapshot at `2026-09-09T13:10:52Z` retained all 148 queue rows and 11 held revisions, with zero active jobs, publishing rows, generation rows, publication intents or publication attempts and zero jobs touched since deployment.
+
+This is an inert, fail-closed production canary, not provider-readiness evidence. Production expansion remains gated on a separately reviewed configuration change, an authorised cohort and an observation receipt. Never run old and new executors as competing owners of the same queue row. Rollback must preserve ledger-owned unknown states and must not replay the legacy queue.
 
 Remaining programme work includes connection lifecycle/version fences, billing inbox and entitlements, durable generation budgets, fair scheduling and typed UI recovery, provider restoration/compatibility, and account-authorised scheduled canaries. Do not describe the whole SaaS as production-repaired based on this publication slice alone.
