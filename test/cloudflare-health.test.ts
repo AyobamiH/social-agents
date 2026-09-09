@@ -63,6 +63,36 @@ async function main(): Promise<void> {
     assert.equal(capabilities.x.state, 'tenant_scoped');
   });
 
+  await test('health reports rollout controls without exposing tenant identifiers', async () => {
+    const body = await health({
+      SUPABASE_WORKER_CANARY_REQUIRED: 'true',
+      SUPABASE_WORKER_CANARY_USER_IDS: '11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222,11111111-1111-4111-8111-111111111111',
+      SUPABASE_WORKER_GENERATION_ENABLED: 'false',
+      SUPABASE_PROVIDER_DISPATCH_ENABLED: 'false',
+    });
+
+    assert.deepEqual(body.rollout, {
+      tenantScope: 'allowlisted',
+      canaryRequired: true,
+      allowedTenantCount: 2,
+      generationEnabled: false,
+      providerDispatchEnabled: false,
+    });
+    assert.equal(JSON.stringify(body).includes('11111111-1111-4111-8111-111111111111'), false);
+  });
+
+  await test('required canary with no allowlist is visibly blocked', async () => {
+    const body = await health({
+      NODE_ENV: 'production',
+      SUPABASE_WORKER_CANARY_USER_IDS: '',
+    });
+    assert.equal(body.rollout.tenantScope, 'blocked_empty_allowlist');
+    assert.equal(body.rollout.canaryRequired, true);
+    assert.equal(body.rollout.allowedTenantCount, 0);
+    assert.equal(body.rollout.generationEnabled, false);
+    assert.equal(body.rollout.providerDispatchEnabled, false);
+  });
+
   await test('non-SHA Cloudflare version tags are not reported as canonical Git SHAs', async () => {
     const body = await health({
       CF_VERSION_METADATA: {

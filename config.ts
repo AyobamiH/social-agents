@@ -109,6 +109,10 @@ export interface AppConfig {
   CREDENTIAL_ENCRYPTION_KEY: string;
   SUPABASE_WORKER_POLL_INTERVAL_MS: number;
   SUPABASE_WORKER_BATCH_SIZE: number;
+  SUPABASE_WORKER_CANARY_REQUIRED: boolean;
+  SUPABASE_WORKER_CANARY_USER_IDS: Set<string>;
+  SUPABASE_WORKER_GENERATION_ENABLED: boolean;
+  SUPABASE_PROVIDER_DISPATCH_ENABLED: boolean;
   DAILY_INVENTORY_PLANNER_ENABLED: boolean;
   DAILY_INVENTORY_PLANNER_START_LOCAL_DATE: string;
 }
@@ -241,6 +245,18 @@ function buildBaseConfig(): AppConfig {
     CREDENTIAL_ENCRYPTION_KEY: IS_SOCIAL_CONNECTOR_ONLY ? '' : process.env.CREDENTIAL_ENCRYPTION_KEY || '',
     SUPABASE_WORKER_POLL_INTERVAL_MS: Number.parseInt(process.env.SUPABASE_WORKER_POLL_INTERVAL_MS || '10000', 10),
     SUPABASE_WORKER_BATCH_SIZE: Number.parseInt(process.env.SUPABASE_WORKER_BATCH_SIZE || '10', 10),
+    SUPABASE_WORKER_CANARY_REQUIRED:
+      (process.env.NODE_ENV || 'development') === 'production'
+      || parseBooleanEnv(process.env.SUPABASE_WORKER_CANARY_REQUIRED, false),
+    SUPABASE_WORKER_CANARY_USER_IDS: toSubSet(process.env.SUPABASE_WORKER_CANARY_USER_IDS, ''),
+    SUPABASE_WORKER_GENERATION_ENABLED: parseBooleanEnv(
+      process.env.SUPABASE_WORKER_GENERATION_ENABLED,
+      (process.env.NODE_ENV || 'development') !== 'production'
+    ),
+    SUPABASE_PROVIDER_DISPATCH_ENABLED: parseBooleanEnv(
+      process.env.SUPABASE_PROVIDER_DISPATCH_ENABLED,
+      (process.env.NODE_ENV || 'development') !== 'production'
+    ),
     DAILY_INVENTORY_PLANNER_ENABLED: parseBooleanEnv(process.env.DAILY_INVENTORY_PLANNER_ENABLED, false),
     DAILY_INVENTORY_PLANNER_START_LOCAL_DATE: process.env.DAILY_INVENTORY_PLANNER_START_LOCAL_DATE || '',
   };

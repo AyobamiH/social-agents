@@ -9,10 +9,16 @@ crons = ["*/1 * * * *"]
 [version_metadata]
 binding = "CF_VERSION_METADATA"
 
+[secrets]
+required = ["SUPABASE_WORKER_CANARY_USER_IDS"]
+
 [vars]
 NODE_ENV = "production"
-SUPABASE_WORKER_BATCH_SIZE = "5"
-DAILY_INVENTORY_PLANNER_ENABLED = "true"
+SUPABASE_WORKER_BATCH_SIZE = "1"
+SUPABASE_WORKER_CANARY_REQUIRED = "true"
+SUPABASE_WORKER_GENERATION_ENABLED = "false"
+SUPABASE_PROVIDER_DISPATCH_ENABLED = "false"
+DAILY_INVENTORY_PLANNER_ENABLED = "false"
 DAILY_INVENTORY_PLANNER_START_LOCAL_DATE = "2026-07-14"
 HTTP_TIMEOUT_MS = "45000"
 OPENAI_IMAGE_MODEL = "gpt-image-2"
@@ -21,7 +27,7 @@ CLOUDINARY_FOLDER = "social-agent/instagram"
 COLLECTOR_INGEST_ENABLED = "false"
 COLLECTOR_INGEST_WRITE_ENABLED = "false"
 COLLECTOR_INGEST_ENV = "production"
-REDDIT_CONNECTOR_ENABLED = "true"
+REDDIT_CONNECTOR_ENABLED = "false"
 REDDIT_CONNECTOR_MAX_POSTS_PER_RUN = "2"
 REDDIT_CONNECTOR_PAIRING_TTL_SECONDS = "600"
 APP_ALLOWED_ORIGINS = "https://www.oneclickpostfactory.com,https://oneclickpostfactory.woeinvests.workers.dev,https://oneclickwebsitefactory.tailwaggingwebdesign.com"

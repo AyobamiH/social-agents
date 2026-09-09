@@ -352,13 +352,20 @@ export async function reconcilePublication(
 }
 
 /** Also recovers orphaned publish_all attempts after their parent job has already ended. */
-export async function recoverStalePublications(now = Date.now()): Promise<number> {
+export async function recoverStalePublications(
+  now = Date.now(),
+  allowedUserIds?: readonly string[]
+): Promise<number> {
+  if (allowedUserIds?.length === 0) return 0;
   try {
     await ledger.assertPublicationLedgerContract();
     const intents = await supabaseSelect<ledger.PublicationIntent>('publication_intents', {
       filters: [
         { column: 'state', operator: 'in', value: ['claimed', 'dispatching'] },
         { column: 'updated_at', operator: 'lte', value: new Date(now - 180_000).toISOString() },
+        ...(allowedUserIds
+          ? [{ column: 'user_id', operator: 'in' as const, value: [...allowedUserIds] }]
+          : []),
       ],
       order: 'updated_at.asc',
       limit: 50,

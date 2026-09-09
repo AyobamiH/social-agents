@@ -441,6 +441,10 @@ async function main(): Promise<void> {
         DAILY_INVENTORY_PLANNER_ENABLED: false,
         DAILY_INVENTORY_PLANNER_START_LOCAL_DATE: '',
         SUPABASE_WORKER_BATCH_SIZE: 10,
+        SUPABASE_WORKER_CANARY_REQUIRED: true,
+        SUPABASE_WORKER_CANARY_USER_IDS: new Set(),
+        SUPABASE_WORKER_GENERATION_ENABLED: false,
+        SUPABASE_PROVIDER_DISPATCH_ENABLED: false,
       });
 
       assert.ok(issues.some(issue => issue.includes('COOKIE_SECURE')));
@@ -514,6 +518,10 @@ async function main(): Promise<void> {
         DAILY_INVENTORY_PLANNER_ENABLED: false,
         DAILY_INVENTORY_PLANNER_START_LOCAL_DATE: '',
         SUPABASE_WORKER_BATCH_SIZE: 10,
+        SUPABASE_WORKER_CANARY_REQUIRED: true,
+        SUPABASE_WORKER_CANARY_USER_IDS: new Set(),
+        SUPABASE_WORKER_GENERATION_ENABLED: false,
+        SUPABASE_PROVIDER_DISPATCH_ENABLED: false,
       });
 
       assert.ok(issues.some(issue => issue.includes('SUPABASE_SERVICE_ROLE_KEY')));

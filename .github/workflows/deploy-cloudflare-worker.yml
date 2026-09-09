@@ -33,11 +33,25 @@ jobs:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           RELEASE_SHA: ${{ github.sha }}
           ROLLOUT_PREFLIGHT_CONFIRMED: ${{ inputs.rollout_preflight_confirmed }}
+          CANARY_USER_IDS: ${{ secrets.SUPABASE_WORKER_CANARY_USER_IDS }}
         run: |
           set -eu
           test "$ROLLOUT_PREFLIGHT_CONFIRMED" = 'true'
           test "$EXPECTED_SHA" = "$RELEASE_SHA"
           echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          CANARY_USER_IDS="$CANARY_USER_IDS" node <<'NODE'
+          const ids = String(process.env.CANARY_USER_IDS || '')
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean);
+          if (ids.length < 1 || ids.length > 3) {
+            throw new Error('SUPABASE_WORKER_CANARY_USER_IDS must contain 1-3 tenant UUIDs');
+          }
+          const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+          if (new Set(ids.map(value => value.toLowerCase())).size !== ids.length || ids.some(value => !uuid.test(value))) {
+            throw new Error('SUPABASE_WORKER_CANARY_USER_IDS must contain unique tenant UUIDs');
+          }
+          NODE
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -48,7 +62,21 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run ci
-      - run: npx wrangler deploy --tag "${{ github.sha }}"
+      - name: Deploy the allowlisted, provider-disabled canary
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CANARY_USER_IDS: ${{ secrets.SUPABASE_WORKER_CANARY_USER_IDS }}
+        run: |
+          set -eu
+          secrets_file="$RUNNER_TEMP/worker-canary-secrets.json"
+          trap 'rm -f "$secrets_file"' EXIT
+          CANARY_USER_IDS="$CANARY_USER_IDS" SECRETS_FILE="$secrets_file" node <<'NODE'
+          const fs = require('node:fs');
+          fs.writeFileSync(
+            process.env.SECRETS_FILE,
+            JSON.stringify({ SUPABASE_WORKER_CANARY_USER_IDS: process.env.CANARY_USER_IDS }),
+            { mode: 0o600 }
+          );
+          NODE
+          npx wrangler deploy --tag "${{ github.sha }}" --secrets-file "$secrets_file"

@@ -228,7 +228,7 @@ async function main() {
     assert.ok(!publish.includes("supabaseInsert<PublishHistoryRow>"));
     assert.ok(!publish.includes("status: 'failed'"));
     assert.ok(!worker.includes('findPublishHistoryForQueueItem'));
-    assert.ok(worker.includes('await recoverStalePublications(now.getTime())'));
+    assert.ok(worker.includes('await recoverStalePublications(now.getTime(), rolloutAllowedUserIds())'));
   });
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

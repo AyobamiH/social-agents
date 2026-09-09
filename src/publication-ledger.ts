@@ -17,6 +17,7 @@ export const REQUIRED_PUBLICATION_CAPABILITIES = [
   'publication-exact-history-receipt-v1',
   'publication-queue-compatibility-fence-v1',
   'publication-provenance-snapshot-v1',
+  'publication-legacy-queue-hold-v1',
 ] as const;
 
 export interface PublicationSchemaContract {
