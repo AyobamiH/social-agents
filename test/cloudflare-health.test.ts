@@ -39,8 +39,12 @@ async function main(): Promise<void> {
     assert.equal(body.release.workerVersionId, 'worker-version-id');
     assert.equal(body.release.versionTag, gitSha);
     assert.equal(body.release.gitSha, gitSha);
-    assert.equal(body.release.schemaContract, 'pre-publication-ledger-v1');
-    assert.equal(body.release.appliedSchema, 'unverified');
+    assert.equal(body.release.schemaContract, 'publication-ledger-v1');
+    assert.deepEqual(body.release.schemaContracts, {
+      workerClaims: 'worker-claims-v1',
+      publicationLedger: 'publication-ledger-v1',
+    });
+    assert.equal(body.release.appliedSchema, 'not_evaluated');
   });
 
   await test('health does not advertise disabled or unverified publishers as ready', async () => {

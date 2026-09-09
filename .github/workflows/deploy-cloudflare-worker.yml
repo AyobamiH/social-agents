@@ -1,7 +1,7 @@
 name: deploy-cloudflare-worker
 
-# Source merges are not deployment authorisation. Keep publication rollout
-# manual while the schema-first staging, drain and canary gates are outstanding.
+# Source merges are not deployment authorisation. Production deployment remains
+# manual and requires exact release identity plus fail-closed canary controls.
 on:
   workflow_dispatch:
     inputs:
@@ -79,4 +79,44 @@ jobs:
             { mode: 0o600 }
           );
           NODE
-          npx wrangler deploy --tag "${{ github.sha }}" --secrets-file "$secrets_file"
+          npx wrangler deploy --env="" --tag "${{ github.sha }}" --secrets-file "$secrets_file"
+      - name: Verify the exact fail-closed canary release
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          HEALTH_URL: https://oneclickpostfactory-agent.woeinvests.workers.dev/healthz
+        run: |
+          set -eu
+          health_body="$(curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-all-errors "$HEALTH_URL")"
+          HEALTH_BODY="$health_body" EXPECTED_SHA="$EXPECTED_SHA" node <<'NODE'
+          const body = JSON.parse(process.env.HEALTH_BODY || "{}");
+          const expectedSha = process.env.EXPECTED_SHA;
+          const rollout = body.rollout || {};
+          if (body.ok !== true || body.liveness !== "ok") throw new Error("Worker liveness check failed");
+          if (body.release?.gitSha !== expectedSha || body.release?.versionTag !== expectedSha) {
+            throw new Error("Deployed Worker does not match the requested Git SHA");
+          }
+          if (body.release?.schemaContract !== "publication-ledger-v1") {
+            throw new Error("Deployed Worker does not advertise publication-ledger-v1");
+          }
+          if (body.release?.schemaContracts?.workerClaims !== "worker-claims-v1") {
+            throw new Error("Deployed Worker does not advertise worker-claims-v1");
+          }
+          if (rollout.tenantScope !== "allowlisted" || rollout.canaryRequired !== true) {
+            throw new Error("Production canary allowlisting is not active");
+          }
+          if (!Number.isInteger(rollout.allowedTenantCount) || rollout.allowedTenantCount < 1 || rollout.allowedTenantCount > 3) {
+            throw new Error("Production canary tenant count is outside the 1-3 limit");
+          }
+          if (rollout.generationEnabled !== false || rollout.providerDispatchEnabled !== false) {
+            throw new Error("Production generation or provider dispatch is unexpectedly enabled");
+          }
+          console.log(JSON.stringify({
+            ok: true,
+            workerVersionId: body.release?.workerVersionId || null,
+            gitSha: body.release?.gitSha || null,
+            tenantScope: rollout.tenantScope,
+            allowedTenantCount: rollout.allowedTenantCount,
+            generationEnabled: rollout.generationEnabled,
+            providerDispatchEnabled: rollout.providerDispatchEnabled,
+          }));
+          NODE
