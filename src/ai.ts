@@ -543,8 +543,10 @@ async function chatComplete(
   userPrompt: string,
   maxTokens = 500,
   temperature = 0.8,
-  usageContext?: OpenAIUsageContext
+  usageContext?: OpenAIUsageContext,
+  signal?: AbortSignal
 ): Promise<string> {
+  signal?.throwIfAborted();
   const model = config.OPENAI_MODEL || 'gpt-4o';
   const startedAt = Date.now();
   const inputSizeEstimate = systemPrompt.length + userPrompt.length;
@@ -566,6 +568,7 @@ async function chatComplete(
   });
 
   try {
+    signal?.throwIfAborted();
     const { data } = await requestJson<ChatCompletionResponse>('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -574,6 +577,7 @@ async function chatComplete(
       },
       body,
       timeoutMs: config.HTTP_TIMEOUT_MS,
+      signal,
     });
     if (data.error) {
       throw new Error('OpenAI: ' + (data.error.message || 'Unknown error'));
@@ -763,9 +767,10 @@ function chatCompleteJson<T>(
   userPrompt: string,
   maxTokens = 500,
   temperature = 0.6,
-  usageContext?: OpenAIUsageContext
+  usageContext?: OpenAIUsageContext,
+  signal?: AbortSignal
 ): Promise<T> {
-  return chatComplete(systemPrompt, userPrompt, maxTokens, temperature, usageContext)
+  return chatComplete(systemPrompt, userPrompt, maxTokens, temperature, usageContext, signal)
     .then(raw => extractJson<T>(raw));
 }
 
@@ -1672,6 +1677,7 @@ export async function extractSourceBank(
     contentStrategyProfile?: unknown;
     contentStrategyProfileVersion?: string | null;
     usageContext?: OpenAIUsageContext;
+    signal?: AbortSignal;
   } = {}
 ): Promise<SourceExtraction> {
   const source = [post.title, post.selftext].filter(Boolean).join('\n\n').substring(0, 2400);
@@ -1728,7 +1734,8 @@ ${source}
       ...options.usageContext,
       promptVersion: options.usageContext?.promptVersion || TEXT_PROMPT_VERSION,
       stage: OPENAI_TEXT_ANGLE_EXTRACTION_STAGE,
-    }
+    },
+    options.signal
   );
 
   return normalizeSourceExtraction(parsed, post);

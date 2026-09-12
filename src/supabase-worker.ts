@@ -283,6 +283,7 @@ export interface SchedulerStats {
   inventoryPlansChecked: number;
   inventoryAlerts: number;
   skipped: Record<string, number>;
+  errors: Record<string, number>;
 }
 
 type AngleRecordStatus = 'unused' | 'in_progress' | 'drafted' | 'published' | 'rejected' | 'exhausted';
@@ -2350,26 +2351,26 @@ async function recordScheduledAutomationResult(job: AgentJobRow, status: string,
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timeout) clearTimeout(timeout);
-  });
-}
-
-function extractSourceBankWithJobTimeout(
+async function extractSourceBankWithJobTimeout(
   post: RedditPost,
   usageContext?: ai.OpenAIUsageContext,
   contentStrategyOptions: ContentStrategyPromptOptions = {}
 ): Promise<Awaited<ReturnType<typeof ai.extractSourceBank>>> {
-  return withTimeout(
-    ai.extractSourceBank(post, { usageContext, ...contentStrategyOptions }),
-    Math.max(5_000, Math.min(ANGLE_EXTRACTION_TIMEOUT_MS, config.HTTP_TIMEOUT_MS - 1_000)),
-    'OpenAI angle extraction timed out before the worker could finalize the job'
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new Error('OpenAI angle extraction timed out before the worker could finalize the job')),
+    Math.max(5_000, Math.min(ANGLE_EXTRACTION_TIMEOUT_MS, config.HTTP_TIMEOUT_MS - 1_000))
   );
+  try {
+    // Await cancellation and usage bookkeeping before the source claim can be released.
+    const extraction = await ai.extractSourceBank(post, {
+      usageContext, ...contentStrategyOptions, signal: controller.signal,
+    });
+    controller.signal.throwIfAborted();
+    return extraction;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function completeJob(job: AgentJobRow, result: JsonMap): Promise<string> {
@@ -3984,6 +3985,23 @@ async function recordAutomationSkip(
   });
 }
 
+async function recordSchedulerFailure(
+  stats: SchedulerStats, stage: string, error: unknown, userId?: string
+): Promise<void> {
+  stats.errors[stage] = (stats.errors[stage] || 0) + 1;
+  // Do not put arbitrary provider/DB exception text into cross-tenant diagnostics.
+  const context = { stage, scope: userId ? 'tenant' : 'stage' };
+  logger.error('automation_scheduler_failed', context);
+  if (userId) {
+    await writeWorkerLog(userId, 'error', 'automation_scheduler_failed', {
+      ...context,
+      message: 'This scheduling check failed. Other checks will continue.',
+      nextAction: 'Review this tenant’s worker logs and connection state before retrying.',
+      ...(error instanceof WorkerJobError ? { code: error.code } : {}),
+    });
+  }
+}
+
 async function enqueueDueFetchJobs(stats: SchedulerStats, now: Date): Promise<void> {
   if (!config.SUPABASE_WORKER_GENERATION_ENABLED) return;
   const allowedUserIds = rolloutAllowedUserIds();
@@ -4001,78 +4019,82 @@ async function enqueueDueFetchJobs(stats: SchedulerStats, now: Date): Promise<vo
   });
 
   for (const settings of settingsRows) {
-    stats.tenantsChecked++;
-    if (!fetchIsDue(settings, now)) {
-      incrementSchedulerSkip(stats, 'fetch_not_due');
-      continue;
-    }
+    try {
+      stats.tenantsChecked++;
+      if (!fetchIsDue(settings, now)) {
+        incrementSchedulerSkip(stats, 'fetch_not_due');
+        continue;
+      }
 
-    const entitlement = await loadEntitlement(settings.user_id);
-    if (!entitlement.canWrite) {
-      incrementSchedulerSkip(stats, `fetch_access_${entitlement.reason}`);
-      await recordAutomationSkip(
-        settings.user_id,
-        'fetch_sources',
-        entitlement.reason,
-        'Scheduled fetch is blocked by billing or access state.',
-        'Restore billing access or dev/test access, then wait for the next scheduled run.'
-      );
-      continue;
-    }
+      const entitlement = await loadEntitlement(settings.user_id);
+      if (!entitlement.canWrite) {
+        incrementSchedulerSkip(stats, `fetch_access_${entitlement.reason}`);
+        await recordAutomationSkip(
+          settings.user_id,
+          'fetch_sources',
+          entitlement.reason,
+          'Scheduled fetch is blocked by billing or access state.',
+          'Restore billing access or dev/test access, then wait for the next scheduled run.'
+        );
+        continue;
+      }
 
-    if (!(await hasEnabledSource(settings.user_id))) {
-      incrementSchedulerSkip(stats, 'fetch_no_enabled_sources');
-      await recordAutomationSkip(
-        settings.user_id,
-        'fetch_sources',
-        'no_enabled_sources',
-        'Automation is enabled, but no enabled sources are configured.',
-        'Add an enabled Reddit user, subreddit, or approved discovery feed.'
-      );
-      continue;
-    }
+      if (!(await hasEnabledSource(settings.user_id))) {
+        incrementSchedulerSkip(stats, 'fetch_no_enabled_sources');
+        await recordAutomationSkip(
+          settings.user_id,
+          'fetch_sources',
+          'no_enabled_sources',
+          'Automation is enabled, but no enabled sources are configured.',
+          'Add an enabled Reddit user, subreddit, or approved discovery feed.'
+        );
+        continue;
+      }
 
-    if (await hasPendingOrRunningFetch(settings.user_id)) {
-      incrementSchedulerSkip(stats, 'fetch_already_pending_or_running');
-      continue;
-    }
+      if (await hasPendingOrRunningFetch(settings.user_id)) {
+        incrementSchedulerSkip(stats, 'fetch_already_pending_or_running');
+        continue;
+      }
 
-    const dueAt = settings.next_fetch_at || now.toISOString();
-    const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
-      user_id: settings.user_id,
-      kind: 'fetch_sources',
-      payload: {
-        source: SCHEDULED_SOURCE,
-        scheduler: SCHEDULER_NAME,
-        due_at: dueAt,
-      },
-    }, true);
-    const job = inserted[0];
-    const nextFetchAt = addMinutesIso(now, cadenceMinutes(settings));
-    await supabaseUpdate('user_settings', {
-      last_scheduled_fetch_at: now.toISOString(),
-      last_scheduled_job_id: job?.id || null,
-      next_fetch_at: nextFetchAt,
-      last_automation_result: {
-        jobId: job?.id || null,
+      const dueAt = settings.next_fetch_at || now.toISOString();
+      const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
+        user_id: settings.user_id,
         kind: 'fetch_sources',
-        status: 'pending',
-        origin: 'scheduled',
-        message: 'Scheduled fetch was queued by Cloudflare cron.',
-        nextAction: 'Wait for the worker to process this scheduled fetch.',
+        payload: {
+          source: SCHEDULED_SOURCE,
+          scheduler: SCHEDULER_NAME,
+          due_at: dueAt,
+        },
+      }, true);
+      const job = inserted[0];
+      const nextFetchAt = addMinutesIso(now, cadenceMinutes(settings));
+      await supabaseUpdate('user_settings', {
+        last_scheduled_fetch_at: now.toISOString(),
+        last_scheduled_job_id: job?.id || null,
+        next_fetch_at: nextFetchAt,
+        last_automation_result: {
+          jobId: job?.id || null,
+          kind: 'fetch_sources',
+          status: 'pending',
+          origin: 'scheduled',
+          message: 'Scheduled fetch was queued by Cloudflare cron.',
+          nextAction: 'Wait for the worker to process this scheduled fetch.',
+          dueAt,
+          nextFetchAt,
+        },
+      }, {
+        filters: [{ column: 'user_id', operator: 'eq', value: settings.user_id }],
+      });
+      stats.fetchJobsEnqueued++;
+      await writeWorkerLog(settings.user_id, 'info', 'scheduled_fetch_enqueued', {
+        jobId: job?.id || null,
         dueAt,
         nextFetchAt,
-      },
-    }, {
-      filters: [{ column: 'user_id', operator: 'eq', value: settings.user_id }],
-    });
-    stats.fetchJobsEnqueued++;
-    await writeWorkerLog(settings.user_id, 'info', 'scheduled_fetch_enqueued', {
-      jobId: job?.id || null,
-      dueAt,
-      nextFetchAt,
-      scheduler: SCHEDULER_NAME,
-    });
+        scheduler: SCHEDULER_NAME,
+      });
+    } catch (error) {
+      await recordSchedulerFailure(stats, 'fetch', error, settings.user_id);
+    }
   }
 }
 
@@ -4158,62 +4180,128 @@ async function enqueueDueSlotFillJobs(stats: SchedulerStats, now: Date): Promise
   });
 
   for (const settings of settingsRows) {
-    stats.tenantsChecked++;
+    try {
+      stats.tenantsChecked++;
 
-    if (hasRecentOpenAIAutomationFailure(settings, now)) {
-      incrementSchedulerSkip(stats, 'fill_openai_generation_pause_active');
-      continue;
-    }
+      if (hasRecentOpenAIAutomationFailure(settings, now)) {
+        incrementSchedulerSkip(stats, 'fill_openai_generation_pause_active');
+        continue;
+      }
 
-    const entitlement = await loadEntitlement(settings.user_id);
-    if (!entitlement.canWrite) {
-      incrementSchedulerSkip(stats, `fill_access_${entitlement.reason}`);
-      await recordAutomationSkip(
-        settings.user_id,
-        'refresh_queue',
-        entitlement.reason,
-        'Scheduled slot fill is blocked by billing or access state.',
-        'Restore billing access or dev/test access before automation can fill open slots.'
-      );
-      continue;
-    }
+      const entitlement = await loadEntitlement(settings.user_id);
+      if (!entitlement.canWrite) {
+        incrementSchedulerSkip(stats, `fill_access_${entitlement.reason}`);
+        await recordAutomationSkip(
+          settings.user_id,
+          'refresh_queue',
+          entitlement.reason,
+          'Scheduled slot fill is blocked by billing or access state.',
+          'Restore billing access or dev/test access before automation can fill open slots.'
+        );
+        continue;
+      }
 
-    const tenant = await loadTenantContext(settings.user_id);
-    if (!tenant.activePlatforms.length) {
-      incrementSchedulerSkip(stats, 'fill_no_enabled_platforms');
-      continue;
-    }
+      const tenant = await loadTenantContext(settings.user_id);
+      if (!tenant.activePlatforms.length) {
+        incrementSchedulerSkip(stats, 'fill_no_enabled_platforms');
+        continue;
+      }
 
-    const timeZone = tenantAutomationTimeZone(tenant);
-    const targetLocalDate = tenantLocalDatePlusDays(now, timeZone, 1);
-    const activeRows = await loadActiveQueueRows(settings.user_id);
-    const occupiedSlots = buildPlatformSlotOccupancy(activeRows, timeZone);
+      const timeZone = tenantAutomationTimeZone(tenant);
+      const targetLocalDate = tenantLocalDatePlusDays(now, timeZone, 1);
+      const activeRows = await loadActiveQueueRows(settings.user_id);
+      const occupiedSlots = buildPlatformSlotOccupancy(activeRows, timeZone);
 
-    if (plannerActiveForTarget(targetLocalDate)) {
-      stats.inventoryPlansChecked++;
-      const plan = buildDailyInventoryPlan(
-        tenant.activePlatforms,
-        activeRows as DailyInventoryQueueRow[],
-        targetLocalDate
-      );
-      if (plan.complete) {
-        incrementSchedulerSkip(stats, 'daily_inventory_complete');
+      if (plannerActiveForTarget(targetLocalDate)) {
+        stats.inventoryPlansChecked++;
+        const plan = buildDailyInventoryPlan(
+          tenant.activePlatforms,
+          activeRows as DailyInventoryQueueRow[],
+          targetLocalDate
+        );
+        if (plan.complete) {
+          incrementSchedulerSkip(stats, 'daily_inventory_complete');
+          continue;
+        }
+
+        if (await hasPendingOrRunningFetch(settings.user_id)) {
+          incrementSchedulerSkip(stats, 'daily_inventory_work_already_pending_or_running');
+          continue;
+        }
+
+        const missingPlatforms = tenant.activePlatforms.filter(
+          platform => plan.platforms[platform]?.missingSlotIndexes.length
+        );
+        const hasAngles = await hasDraftableActiveAngle(settings.user_id, missingPlatforms);
+        const hasSources = hasAngles ? false : await hasProcessableSourceRecord(settings.user_id);
+        if (!hasAngles && !hasSources) {
+          incrementSchedulerSkip(stats, 'daily_inventory_insufficient');
+          await recordDailyInventoryAlert(settings, plan, stats);
+          continue;
+        }
+
+        const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
+          user_id: settings.user_id,
+          kind: 'refresh_queue',
+          payload: {
+            source: SCHEDULED_SOURCE,
+            scheduler: SCHEDULER_NAME,
+            mode: 'next_day_inventory',
+            fill_existing_angles_only: hasAngles,
+            target_local_date: targetLocalDate,
+            due_at: now.toISOString(),
+          },
+        }, true);
+        const job = inserted[0];
+        await updateAutomationResult(settings.user_id, {
+          jobId: job?.id || null,
+          kind: 'refresh_queue',
+          status: 'pending',
+          origin: 'scheduled',
+          mode: 'next_day_inventory',
+          targetLocalDate,
+          message: 'Bounded next-day inventory work was queued.',
+          nextAction: 'Wait for the worker to prepare approved drafts for the missing slots.',
+          dueAt: now.toISOString(),
+          missingSlotCount: plan.missingSlotCount,
+        }, {
+          last_scheduled_job_id: job?.id || null,
+        });
+        stats.slotFillJobsEnqueued++;
+        await writeWorkerLog(settings.user_id, 'info', 'daily_inventory_fill_enqueued', {
+          jobId: job?.id || null,
+          targetLocalDate,
+          missingSlotCount: plan.missingSlotCount,
+          scheduler: SCHEDULER_NAME,
+        });
+        continue;
+      }
+
+      const capacity = platformSlotCapacitySnapshot(tenant.activePlatforms, occupiedSlots);
+      if (!capacity.hasOpenSlots) {
+        incrementSchedulerSkip(stats, 'refresh_queue_skipped_no_open_slots');
+        await recordAutomationSkip(
+          settings.user_id,
+          'refresh_queue',
+          'refresh_queue_skipped_no_open_slots',
+          'Queue slots are full. Automation skipped drafting until a slot opens.',
+          'Wait for scheduled publishing to free slots, or add more future capacity.',
+          {
+            activeSlotsByPlatform: capacity.activeSlotsByPlatform,
+            openSlotsByPlatform: capacity.openSlotsByPlatform,
+            timezone: timeZone,
+          }
+        );
         continue;
       }
 
       if (await hasPendingOrRunningFetch(settings.user_id)) {
-        incrementSchedulerSkip(stats, 'daily_inventory_work_already_pending_or_running');
+        incrementSchedulerSkip(stats, 'fill_already_pending_or_running');
         continue;
       }
 
-      const missingPlatforms = tenant.activePlatforms.filter(
-        platform => plan.platforms[platform]?.missingSlotIndexes.length
-      );
-      const hasAngles = await hasDraftableActiveAngle(settings.user_id, missingPlatforms);
-      const hasSources = hasAngles ? false : await hasProcessableSourceRecord(settings.user_id);
-      if (!hasAngles && !hasSources) {
-        incrementSchedulerSkip(stats, 'daily_inventory_insufficient');
-        await recordDailyInventoryAlert(settings, plan, stats);
+      if (!(await hasDraftableActiveAngle(settings.user_id, tenant.activePlatforms))) {
+        incrementSchedulerSkip(stats, 'fill_no_unused_angles');
         continue;
       }
 
@@ -4223,9 +4311,8 @@ async function enqueueDueSlotFillJobs(stats: SchedulerStats, now: Date): Promise
         payload: {
           source: SCHEDULED_SOURCE,
           scheduler: SCHEDULER_NAME,
-          mode: 'next_day_inventory',
-          fill_existing_angles_only: hasAngles,
-          target_local_date: targetLocalDate,
+          mode: 'fill_existing_angles',
+          fill_existing_angles_only: true,
           due_at: now.toISOString(),
         },
       }, true);
@@ -4235,83 +4322,22 @@ async function enqueueDueSlotFillJobs(stats: SchedulerStats, now: Date): Promise
         kind: 'refresh_queue',
         status: 'pending',
         origin: 'scheduled',
-        mode: 'next_day_inventory',
-        targetLocalDate,
-        message: 'Bounded next-day inventory work was queued.',
-        nextAction: 'Wait for the worker to prepare approved drafts for the missing slots.',
+        mode: 'fill_existing_angles',
+        message: 'Scheduled slot fill was queued from existing unused angles.',
+        nextAction: 'Wait for the worker to draft an unused angle into the next open slot.',
         dueAt: now.toISOString(),
-        missingSlotCount: plan.missingSlotCount,
       }, {
         last_scheduled_job_id: job?.id || null,
       });
       stats.slotFillJobsEnqueued++;
-      await writeWorkerLog(settings.user_id, 'info', 'daily_inventory_fill_enqueued', {
+      await writeWorkerLog(settings.user_id, 'info', 'scheduled_slot_fill_enqueued', {
         jobId: job?.id || null,
-        targetLocalDate,
-        missingSlotCount: plan.missingSlotCount,
+        dueAt: now.toISOString(),
         scheduler: SCHEDULER_NAME,
       });
-      continue;
+    } catch (error) {
+      await recordSchedulerFailure(stats, 'slot_fill', error, settings.user_id);
     }
-
-    const capacity = platformSlotCapacitySnapshot(tenant.activePlatforms, occupiedSlots);
-    if (!capacity.hasOpenSlots) {
-      incrementSchedulerSkip(stats, 'refresh_queue_skipped_no_open_slots');
-      await recordAutomationSkip(
-        settings.user_id,
-        'refresh_queue',
-        'refresh_queue_skipped_no_open_slots',
-        'Queue slots are full. Automation skipped drafting until a slot opens.',
-        'Wait for scheduled publishing to free slots, or add more future capacity.',
-        {
-          activeSlotsByPlatform: capacity.activeSlotsByPlatform,
-          openSlotsByPlatform: capacity.openSlotsByPlatform,
-          timezone: timeZone,
-        }
-      );
-      continue;
-    }
-
-    if (await hasPendingOrRunningFetch(settings.user_id)) {
-      incrementSchedulerSkip(stats, 'fill_already_pending_or_running');
-      continue;
-    }
-
-    if (!(await hasDraftableActiveAngle(settings.user_id, tenant.activePlatforms))) {
-      incrementSchedulerSkip(stats, 'fill_no_unused_angles');
-      continue;
-    }
-
-    const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
-      user_id: settings.user_id,
-      kind: 'refresh_queue',
-      payload: {
-        source: SCHEDULED_SOURCE,
-        scheduler: SCHEDULER_NAME,
-        mode: 'fill_existing_angles',
-        fill_existing_angles_only: true,
-        due_at: now.toISOString(),
-      },
-    }, true);
-    const job = inserted[0];
-    await updateAutomationResult(settings.user_id, {
-      jobId: job?.id || null,
-      kind: 'refresh_queue',
-      status: 'pending',
-      origin: 'scheduled',
-      mode: 'fill_existing_angles',
-      message: 'Scheduled slot fill was queued from existing unused angles.',
-      nextAction: 'Wait for the worker to draft an unused angle into the next open slot.',
-      dueAt: now.toISOString(),
-    }, {
-      last_scheduled_job_id: job?.id || null,
-    });
-    stats.slotFillJobsEnqueued++;
-    await writeWorkerLog(settings.user_id, 'info', 'scheduled_slot_fill_enqueued', {
-      jobId: job?.id || null,
-      dueAt: now.toISOString(),
-      scheduler: SCHEDULER_NAME,
-    });
   }
 }
 
@@ -4366,102 +4392,106 @@ async function enqueueDuePublishJobs(stats: SchedulerStats, now: Date): Promise<
   });
 
   for (const row of dueRows) {
-    if (row.legacy_revision_hold_id) {
-      incrementSchedulerSkip(stats, LEGACY_QUEUE_REVISION_HELD_CODE);
-      await recordAutomationSkip(
-        row.user_id,
-        'publish_now',
-        LEGACY_QUEUE_REVISION_HELD_CODE,
-        LEGACY_QUEUE_REVISION_HELD_MESSAGE,
-        LEGACY_QUEUE_REVISION_HELD_NEXT_ACTION,
-        { queueItemId: row.id, platform: row.platform }
-      );
-      continue;
-    }
+    try {
+      if (row.legacy_revision_hold_id) {
+        incrementSchedulerSkip(stats, LEGACY_QUEUE_REVISION_HELD_CODE);
+        await recordAutomationSkip(
+          row.user_id,
+          'publish_now',
+          LEGACY_QUEUE_REVISION_HELD_CODE,
+          LEGACY_QUEUE_REVISION_HELD_MESSAGE,
+          LEGACY_QUEUE_REVISION_HELD_NEXT_ACTION,
+          { queueItemId: row.id, platform: row.platform }
+        );
+        continue;
+      }
 
-    const settings = settingsByUser.get(row.user_id);
-    if (!settings || !settings.automation_publish_enabled) {
-      incrementSchedulerSkip(stats, 'publish_automation_disabled');
-      continue;
-    }
+      const settings = settingsByUser.get(row.user_id);
+      if (!settings || !settings.automation_publish_enabled) {
+        incrementSchedulerSkip(stats, 'publish_automation_disabled');
+        continue;
+      }
 
-    const priorFailedRecovery = await loadPriorFailedRecovery(row);
-    if (priorFailedRecovery) {
-      incrementSchedulerSkip(stats, 'publish_recovery_paused_after_failure');
-      await supabaseUpdate('queue_items', {
-        status: 'skipped',
-        error_message: 'Recovery paused because an earlier recovery on this platform failed. Review the earlier attempt before rescheduling.',
+      const priorFailedRecovery = await loadPriorFailedRecovery(row);
+      if (priorFailedRecovery) {
+        incrementSchedulerSkip(stats, 'publish_recovery_paused_after_failure');
+        await supabaseUpdate('queue_items', {
+          status: 'skipped',
+          error_message: 'Recovery paused because an earlier recovery on this platform failed. Review the earlier attempt before rescheduling.',
+        }, {
+          filters: [
+            { column: 'id', operator: 'eq', value: row.id },
+            { column: 'user_id', operator: 'eq', value: row.user_id },
+            { column: 'status', operator: 'in', value: ['pending', 'ready'] },
+          ],
+        });
+        await recordAutomationSkip(
+          row.user_id,
+          'publish_now',
+          'publish_recovery_paused_after_failure',
+          'A scheduled recovery was paused because an earlier recovery on this platform failed.',
+          'Review the earlier recovery attempt before rescheduling this row.',
+          {
+            queueItemId: row.id,
+            platform: row.platform,
+            priorQueueItemId: priorFailedRecovery.id,
+          }
+        );
+        continue;
+      }
+
+      const entitlement = await loadEntitlement(row.user_id);
+      if (!entitlement.canWrite) {
+        incrementSchedulerSkip(stats, `publish_access_${entitlement.reason}`);
+        await recordAutomationSkip(
+          row.user_id,
+          'publish_now',
+          entitlement.reason,
+          'Scheduled publish is blocked by billing or access state.',
+          'Restore billing access or dev/test access before scheduled publishing can continue.'
+        );
+        continue;
+      }
+
+      if (await hasPendingOrRunningPublish(row.user_id, row.id)) {
+        incrementSchedulerSkip(stats, 'publish_already_pending_or_running');
+        continue;
+      }
+
+      const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
+        user_id: row.user_id,
+        kind: 'publish_now',
+        payload: {
+          source: SCHEDULED_SOURCE,
+          scheduler: SCHEDULER_NAME,
+          queue_item_id: row.id,
+          due_at: row.scheduled_for,
+        },
+      }, true);
+      const job = inserted[0];
+      await updateAutomationResult(row.user_id, {
+        jobId: job?.id || null,
+        kind: 'publish_now',
+        status: 'pending',
+        origin: 'scheduled',
+        message: `Scheduled ${row.platform} publish was queued.`,
+        nextAction: 'Wait for the worker to publish this due queue item.',
+        queueItemId: row.id,
+        dueAt: row.scheduled_for,
       }, {
-        filters: [
-          { column: 'id', operator: 'eq', value: row.id },
-          { column: 'user_id', operator: 'eq', value: row.user_id },
-          { column: 'status', operator: 'in', value: ['pending', 'ready'] },
-        ],
+        last_scheduled_job_id: job?.id || null,
       });
-      await recordAutomationSkip(
-        row.user_id,
-        'publish_now',
-        'publish_recovery_paused_after_failure',
-        'A scheduled recovery was paused because an earlier recovery on this platform failed.',
-        'Review the earlier recovery attempt before rescheduling this row.',
-        {
-          queueItemId: row.id,
-          platform: row.platform,
-          priorQueueItemId: priorFailedRecovery.id,
-        }
-      );
-      continue;
-    }
-
-    const entitlement = await loadEntitlement(row.user_id);
-    if (!entitlement.canWrite) {
-      incrementSchedulerSkip(stats, `publish_access_${entitlement.reason}`);
-      await recordAutomationSkip(
-        row.user_id,
-        'publish_now',
-        entitlement.reason,
-        'Scheduled publish is blocked by billing or access state.',
-        'Restore billing access or dev/test access before scheduled publishing can continue.'
-      );
-      continue;
-    }
-
-    if (await hasPendingOrRunningPublish(row.user_id, row.id)) {
-      incrementSchedulerSkip(stats, 'publish_already_pending_or_running');
-      continue;
-    }
-
-    const inserted = await supabaseInsert<AgentJobRow>('agent_jobs', {
-      user_id: row.user_id,
-      kind: 'publish_now',
-      payload: {
-        source: SCHEDULED_SOURCE,
+      stats.publishJobsEnqueued++;
+      await writeWorkerLog(row.user_id, 'info', 'scheduled_publish_enqueued', {
+        jobId: job?.id || null,
+        queueItemId: row.id,
+        platform: row.platform,
+        dueAt: row.scheduled_for,
         scheduler: SCHEDULER_NAME,
-        queue_item_id: row.id,
-        due_at: row.scheduled_for,
-      },
-    }, true);
-    const job = inserted[0];
-    await updateAutomationResult(row.user_id, {
-      jobId: job?.id || null,
-      kind: 'publish_now',
-      status: 'pending',
-      origin: 'scheduled',
-      message: `Scheduled ${row.platform} publish was queued.`,
-      nextAction: 'Wait for the worker to publish this due queue item.',
-      queueItemId: row.id,
-      dueAt: row.scheduled_for,
-    }, {
-      last_scheduled_job_id: job?.id || null,
-    });
-    stats.publishJobsEnqueued++;
-    await writeWorkerLog(row.user_id, 'info', 'scheduled_publish_enqueued', {
-      jobId: job?.id || null,
-      queueItemId: row.id,
-      platform: row.platform,
-      dueAt: row.scheduled_for,
-      scheduler: SCHEDULER_NAME,
-    });
+      });
+    } catch (error) {
+      await recordSchedulerFailure(stats, 'publish', error, row.user_id);
+    }
   }
 }
 
@@ -4843,54 +4873,58 @@ async function cleanupStaleRunningJobs(stats: SchedulerStats, now: Date): Promis
   });
 
   for (const job of jobs) {
-    const staleCutoff = addMinutesIso(now, -staleMinutesForJob(job));
-    const startedAt = Date.parse(job.started_at || '');
-    const staleCutoffMs = Date.parse(staleCutoff);
-    if (
-      Number.isFinite(startedAt)
-      && Number.isFinite(staleCutoffMs)
-      && startedAt > staleCutoffMs
-    ) {
-      incrementSchedulerSkip(stats, 'stale_job_within_kind_runtime');
-      continue;
-    }
+    try {
+      const staleCutoff = addMinutesIso(now, -staleMinutesForJob(job));
+      const startedAt = Date.parse(job.started_at || '');
+      const staleCutoffMs = Date.parse(staleCutoff);
+      if (
+        Number.isFinite(startedAt)
+        && Number.isFinite(staleCutoffMs)
+        && startedAt > staleCutoffMs
+      ) {
+        incrementSchedulerSkip(stats, 'stale_job_within_kind_runtime');
+        continue;
+      }
 
-    const logs = await staleJobLogs(job);
-    if (job.kind === 'refresh_queue' && hasRecentJobActivity(logs, cutoff)) {
-      incrementSchedulerSkip(stats, 'stale_refresh_recent_activity');
-      continue;
-    }
+      const logs = await staleJobLogs(job);
+      if (job.kind === 'refresh_queue' && hasRecentJobActivity(logs, cutoff)) {
+        incrementSchedulerSkip(stats, 'stale_refresh_recent_activity');
+        continue;
+      }
 
-    const releasedAngleLocks = await releaseStaleRefreshAngleLocks(job, logs);
-    const details = staleFailureFromLogs(logs);
-    const result = job.kind === 'publish_now'
-      ? await stalePublishJobResult(job, logs)
-      : staleJobResult(job, logs, details);
-    const summary = resultSummary(result);
-    const error = String(summary.failureCode || result.error || 'worker_job_timed_out');
-    const status = terminalStatusForResult(result);
-    await supabaseUpdate('agent_jobs', {
-      status,
-      completed_at: now.toISOString(),
-      error,
-      result,
-    }, {
-      filters: [
-        { column: 'id', operator: 'eq', value: job.id },
-        { column: 'status', operator: 'eq', value: 'running' },
-      ],
-    });
-    await recordScheduledAutomationResult(job, status, result);
-    stats.staleJobsFailed++;
-    await writeWorkerLog(job.user_id, 'warn', 'stale_running_job_failed', {
-      jobId: job.id,
-      kind: job.kind,
-      reason: error,
-      status,
-      failedStage: typeof summary.failedStage === 'string' ? summary.failedStage : null,
-      releasedAngleLocks,
-      startedAt: job.started_at || null,
-    });
+      const releasedAngleLocks = await releaseStaleRefreshAngleLocks(job, logs);
+      const details = staleFailureFromLogs(logs);
+      const result = job.kind === 'publish_now'
+        ? await stalePublishJobResult(job, logs)
+        : staleJobResult(job, logs, details);
+      const summary = resultSummary(result);
+      const error = String(summary.failureCode || result.error || 'worker_job_timed_out');
+      const status = terminalStatusForResult(result);
+      await supabaseUpdate('agent_jobs', {
+        status,
+        completed_at: now.toISOString(),
+        error,
+        result,
+      }, {
+        filters: [
+          { column: 'id', operator: 'eq', value: job.id },
+          { column: 'status', operator: 'eq', value: 'running' },
+        ],
+      });
+      await recordScheduledAutomationResult(job, status, result);
+      stats.staleJobsFailed++;
+      await writeWorkerLog(job.user_id, 'warn', 'stale_running_job_failed', {
+        jobId: job.id,
+        kind: job.kind,
+        reason: error,
+        status,
+        failedStage: typeof summary.failedStage === 'string' ? summary.failedStage : null,
+        releasedAngleLocks,
+        startedAt: job.started_at || null,
+      });
+    } catch (error) {
+      await recordSchedulerFailure(stats, 'job_recovery', error, job.user_id);
+    }
   }
 }
 
@@ -4904,13 +4938,25 @@ export async function runSupabaseAutomationScheduler(): Promise<SchedulerStats> 
     inventoryPlansChecked: 0,
     inventoryAlerts: 0,
     skipped: {},
+    errors: {},
   };
   const now = new Date();
-  await recoverStalePublications(now.getTime(), rolloutAllowedUserIds());
-  await cleanupStaleRunningJobs(stats, now);
-  await enqueueDueFetchJobs(stats, now);
-  await enqueueDueSlotFillJobs(stats, now);
-  await enqueueDuePublishJobs(stats, now);
+  const stages: Array<[string, () => Promise<unknown>]> = [
+    ['publication_recovery', () => recoverStalePublications(now.getTime(), rolloutAllowedUserIds())],
+    ['job_recovery', () => cleanupStaleRunningJobs(stats, now)],
+    ['fetch', () => enqueueDueFetchJobs(stats, now)],
+    ['slot_fill', () => enqueueDueSlotFillJobs(stats, now)],
+    ['publish', () => enqueueDuePublishJobs(stats, now)],
+  ];
+  for (const [stage, run] of stages) {
+    try {
+      await run();
+    } catch (error) {
+      // Each consumer still applies its own entitlement, claims and rollout gates.
+      // An unavailable input in one stage must not suppress independent stages.
+      await recordSchedulerFailure(stats, stage, error);
+    }
+  }
   return stats;
 }
 
@@ -5016,6 +5062,7 @@ export function startSupabaseWorkerLoop(log = logger): { stop: () => void } | un
 }
 
 export const __test__ = {
+  extractSourceBankWithJobTimeout,
   assertQueueRevisionNotHeld,
   publishQueueRow,
   stalePublishJobResult,
