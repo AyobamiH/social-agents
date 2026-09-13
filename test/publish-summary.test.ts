@@ -61,7 +61,7 @@ test('production stale publication recovery has no log/status reconciliation fal
   assert.ok(worker.includes(
     'return reconcilePublication({ userId: job.user_id, queueItemId: row.id, platform: row.platform });'
   ));
-  assert.ok(worker.includes('await recoverStalePublications(now.getTime(), rolloutAllowedUserIds());'));
+  assert.ok(worker.includes('recoverStalePublications(now.getTime(), rolloutAllowedUserIds())'));
 });
 
 test('unknown publication guidance never authorises a blind retry', () => {

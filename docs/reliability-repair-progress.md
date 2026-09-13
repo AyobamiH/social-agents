@@ -1,5 +1,9 @@
 # Reliability repair progress
 
+Current continuation: [12 September implementation checkpoint](implementation-checkpoint-20260912.md).
+It reconciles the superseded September 6 branch, current repairs and remaining
+release gates. The September 9 deployment below remains an inert canary.
+
 This file records implementation and rollout status. Exact-SHA CI receipts remain on the relevant pull requests and deployment runs. A passing component test is not live account evidence.
 
 ## Sequence 1: release identity and complete CI gate
