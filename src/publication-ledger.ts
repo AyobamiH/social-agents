@@ -18,6 +18,7 @@ export const REQUIRED_PUBLICATION_CAPABILITIES = [
   'publication-queue-compatibility-fence-v1',
   'publication-provenance-snapshot-v1',
   'publication-legacy-queue-hold-v1',
+  'publication-queue-lock-order-v1',
 ] as const;
 
 export interface PublicationSchemaContract {

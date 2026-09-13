@@ -77,6 +77,22 @@ async function main(): Promise<void> {
       );
     });
 
+    await test('publication dispatch requires the queue lock-order migration capability', async () => {
+      globalThis.fetch = (async () => Response.json({
+        contract: PUBLICATION_SCHEMA_CONTRACT,
+        migration: PUBLICATION_SCHEMA_MIGRATION,
+        capabilities: REQUIRED_PUBLICATION_CAPABILITIES.filter(
+          capability => capability !== 'publication-queue-lock-order-v1'
+        ),
+      })) as typeof fetch;
+      await assert.rejects(
+        () => assertPublicationLedgerContract(),
+        (error: unknown) => error instanceof PublicationLedgerContractError
+          && error.code === 'publication_ledger_schema_unavailable'
+          && error.message.includes('publication-queue-lock-order-v1')
+      );
+    });
+
     await test('claim, release, and dispatch preserve exact fencing identities', async () => {
       const bodies: Array<{ url: string; body: Record<string, unknown> }> = [];
       const claimToken = '61000000-0000-4000-8000-000000000001';
