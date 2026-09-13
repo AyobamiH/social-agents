@@ -41,11 +41,16 @@ const texts = new Map<string, string[]>();
 const modes = new Map<string, 'timeout' | 'reject' | 'pause' | 'late'>();
 let lostRpc: { path: string; remaining: number } | undefined;
 let totalWrites = 0;
+const databaseErrors: Array<{ rpc: string; code: string }> = [];
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input, init) => {
   const url = new URL(String(input));
   if (url.origin === api.origin) {
     const response = await realFetch(input, init);
+    if (!response.ok && url.pathname.includes('/rpc/')) {
+      const failure = await response.clone().json().catch(() => ({})) as { code?: unknown };
+      databaseErrors.push({ rpc: url.pathname.split('/').pop() || 'unknown', code: String(failure.code || 'unknown') });
+    }
     if (lostRpc && url.pathname.endsWith(lostRpc.path) && lostRpc.remaining > 0 && response.ok) {
       lostRpc.remaining--; await response.text(); throw new TypeError('injected response loss after database commit');
     }
@@ -123,11 +128,23 @@ async function main() {
     assert.throws(() => sql(`UPDATE public.queue_items SET draft_text = 'late edit' WHERE id = ${literal(f.row.id)}::uuid;`));
   });
   await test('concurrent real Postgres claimers have exactly one provider writer', async () => {
-    const f = seed();
-    await Promise.all(Array.from({ length: 8 }, () => run(f)));
-    assert.equal(posts.get(f.user), 1);
-    assert.equal(Number(sql(`SELECT count(*) FROM public.publication_attempts WHERE user_id = ${literal(f.user)}::uuid;`)), 1);
-    assert.equal((await state(f)).attempt?.state, 'accepted');
+    for (let round = 0; round < 20; round++) {
+      const f = seed(), errorStart = databaseErrors.length;
+      const results = await Promise.all(Array.from({ length: 8 }, () => run(f)));
+      const current = await state(f);
+      const observed = {
+        round,
+        writes: posts.get(f.user) || 0,
+        outcomes: results.map(r => ({ outcome: r.outcome, failureCode: r.failureCode })),
+        intentState: current.intent?.state,
+        attemptState: current.attempt?.state,
+        databaseErrors: databaseErrors.slice(errorStart),
+      };
+      assert.equal(posts.get(f.user) || 0, 1, JSON.stringify(observed));
+      assert.equal(Number(sql(`SELECT count(*) FROM public.publication_attempts WHERE user_id = ${literal(f.user)}::uuid;`)), 1);
+      assert.equal(current.attempt?.state, 'accepted', JSON.stringify(observed));
+      assert.equal(databaseErrors.slice(errorStart).some(error => error.code === '40P01'), false, JSON.stringify(observed));
+    }
   });
   await test('two tenants interleave with their own encrypted credentials and source snapshots', async () => {
     const a = seed(), b = seed();
