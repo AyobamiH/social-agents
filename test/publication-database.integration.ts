@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { exercisePublicationLockOrder } from './publication-lock-order.integration';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import config from '../config';
@@ -113,6 +114,17 @@ async function test(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
+  for (const operation of ['begin', 'release'] as const) {
+    await test(`controlled ${operation}/claim contention has no database deadlock`, async () => {
+      const f = seed();
+      const intent = await claimPublicationIntent(f.user, f.row.id, randomUUID(), 120);
+      await exercisePublicationLockOrder({
+        databaseName: names[0], sql, userId: f.user, queueId: f.row.id,
+        intentId: intent.id, claimToken: intent.claim_token!, claimVersion: intent.claim_version, operation,
+      });
+      assert.equal(posts.get(f.user) || 0, 0);
+    });
+  }
   await test('real scheduled Worker records exact immutable acceptance and handles duplicate delivery', async () => {
     const f = seed();
     sql(`UPDATE public.queue_items SET draft_text = 'approved revision before claim' WHERE id = ${literal(f.row.id)}::uuid;`);
